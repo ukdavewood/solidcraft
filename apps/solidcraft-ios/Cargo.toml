@@ -6,8 +6,17 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-[lints]
-workspace = true
+# The workspace lints, except unsafe_code: denied, not forbidden, so that src/picker.rs can allow
+# it: UIKit's document picker has no safe Rust API. Keep the rest in sync with [workspace.lints].
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+neg_cmp_op_on_partial_ord = "allow"
 
 [[bin]]
 name = "solidcraft-ios"
@@ -19,3 +28,9 @@ solidcraft-ui-egui = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 log = { workspace = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-ui-kit = { version = "0.3", features = ["objc2-uniform-type-identifiers"] }
+objc2-uniform-type-identifiers = "0.3"

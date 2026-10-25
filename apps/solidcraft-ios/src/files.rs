@@ -71,13 +71,22 @@ impl Files {
         }))
     }
 
+    /// The system picker where there is one; else the in-app browser.
+    fn open_or_browse(&self, exts: &[&str]) -> FilePickerFuture {
+        #[cfg(target_os = "ios")]
+        if let Some(future) = crate::picker::open() {
+            return future;
+        }
+        self.ask(Request::Open, exts)
+    }
+
     /// The services the app asks the host for.
     pub fn services(&self) -> Services {
         let (open, save, file) = (self.clone(), self.clone(), self.clone());
         Services {
-            pick_open: Some(Box::new(move |exts| open.ask(Request::Open, exts))),
+            pick_open: Some(Box::new(move |exts| open.open_or_browse(exts))),
             pick_save: Some(Box::new(move |name, exts| save.ask(Request::Save { name: name.to_owned() }, exts))),
-            pick_file: Some(Box::new(move |_, exts| file.ask(Request::Open, exts))),
+            pick_file: Some(Box::new(move |_, exts| file.open_or_browse(exts))),
             ..Services::default()
         }
     }
