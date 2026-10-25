@@ -21,7 +21,8 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.frames < 3 {
             self.frames += 1;
-            note(&format!("frame {}", self.frames));
+            let (insets, screen, content) = ctx.input(|i| (i.safe_area_insets(), i.viewport_rect(), i.content_rect()));
+            note(&format!("frame {}: insets {insets:?} screen {screen:?} content {content:?}", self.frames));
         }
         self.solve.logic(ctx);
     }
@@ -29,7 +30,11 @@ impl eframe::App for App {
         self.solve.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.solve.ui(ui);
+        // Inside the status bar, the home indicator and any rounded corners.
+        let safe = ui.ctx().content_rect();
+        let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(safe));
+        inner.set_clip_rect(safe);
+        self.solve.ui(&mut inner);
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, self.solve.prefs());
