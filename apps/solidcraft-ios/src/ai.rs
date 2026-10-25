@@ -26,7 +26,7 @@ static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 /// The longest tool answer: the model's context is small.
-const MAX_REPLY: usize = 1200;
+const MAX_REPLY: usize = 600;
 
 fn repaint() {
     if let Some(ctx) = CTX.get() {
@@ -94,6 +94,67 @@ fn load() -> Result<Bridge, String> {
     }
 }
 
+/// A command's result in few words: what it made or changed, else its start.
+fn short_result(r: &Value) -> String {
+    let list = |k: &str| r.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let (made, changed) = (list("created_bodies"), list("changed_bodies"));
+    if made.is_empty() && changed.is_empty() { clip(format!("ok {r}")) } else { format!("ok; created: [{made}]; changed: [{changed}]") }
+}
+
+/// Fillet or chamfer the chosen edges of a body in one step: the model names the kind, the size and
+/// which edges; the edges themselves are picked here (it cannot see them).
+fn round_edges(app: &mut SolveApp, v: &Value) -> String {
+    let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+    let size = v.get("size").and_then(Value::as_f64).filter(|s| s.is_finite() && *s > 0.0);
+    let Some(size) = size else { return "error: size must be a positive number of millimetres".to_string() };
+    let body = match text("body") {
+        b if !b.is_empty() => app.session.world_state().bodies.iter().find(|x| x.name.to_lowercase() == b).map(|x| x.name.clone()),
+        _ => app.session.world_state().bodies.last().map(|x| x.name.clone()),
+    };
+    let Some(body) = body else { return "error: no such body (use inspect_design for the names)".to_string() };
+    let listed = match app.run("model.edges", json!({ "body": body })) {
+        Ok(l) => l,
+        Err(e) => return clip(format!("error: {e}")),
+    };
+    let edges = listed.get("edges").and_then(Value::as_array).cloned().unwrap_or_default();
+    let pt = |e: &Value, k: &str| -> Option<[f64; 3]> {
+        let a = e.get(k)?.as_array()?;
+        Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?])
+    };
+    let zs: Vec<f64> = edges.iter().filter_map(|e| pt(e, "mid").map(|m| m[2])).collect();
+    let (zmin, zmax) = (zs.iter().cloned().fold(f64::INFINITY, f64::min), zs.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+    let tol = 1e-6 * (1.0 + zmax.abs().max(zmin.abs()));
+    let which = text("which");
+    let picked: Vec<Value> = edges
+        .iter()
+        .filter(|e| {
+            let (Some(a), Some(b)) = (pt(e, "start"), pt(e, "end")) else { return false };
+            let flat = (a[2] - b[2]).abs() <= tol;
+            let vertical = (a[0] - b[0]).abs() <= tol && (a[1] - b[1]).abs() <= tol;
+            match which.as_str() {
+                "top" => flat && (a[2] - zmax).abs() <= tol,
+                "bottom" => flat && (a[2] - zmin).abs() <= tol,
+                "vertical" | "sides" => vertical,
+                _ => true,
+            }
+        })
+        .filter_map(|e| Some(json!({ "body": body, "index": e.get("index")?.as_u64()? })))
+        .collect();
+    if picked.is_empty() {
+        return "error: no edges match".to_string();
+    }
+    let chamfer = text("kind").starts_with("cham") || text("kind").starts_with("bevel");
+    let (cmd, params) = if chamfer {
+        ("solid.chamfer", json!({ "edges": picked, "distance": size, "body": body }))
+    } else {
+        ("solid.fillet", json!({ "edges": picked, "radius": size, "body": body }))
+    };
+    match app.run(cmd, params) {
+        Ok(_) => format!("ok: {} {} edges of {body} by {size} mm", if chamfer { "chamfered" } else { "filleted" }, picked.len()),
+        Err(e) => clip(format!("error: {e}")),
+    }
+}
+
 fn clip(mut text: String) -> String {
     if text.len() > MAX_REPLY {
         let mut end = MAX_REPLY;
@@ -130,6 +191,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
                     "round" | "rounded" | "rounding" => "fillet",
                     "bevel" => "chamfer",
                     "remove" | "erase" => "delete",
+                    "clear" | "empty" | "reset" | "wipe" | "restart" => "new design",
                     "dimension" | "size" | "value" => "parameters",
                     other => other,
                 };
@@ -161,11 +223,17 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
         Some("run") => {
             let command = v.get("command").and_then(Value::as_str).unwrap_or("");
             let params = v.get("params").and_then(Value::as_str).and_then(|p| serde_json::from_str::<Value>(p).ok()).filter(Value::is_object);
+            // Starting or opening another design drops what is on screen: not while it holds
+            // unsaved changes (the user saves first, or says so, and the app's own New asks).
+            if ["file.new", "doc.open"].contains(&command) && app.session.is_dirty() {
+                return "refused: the open design has unsaved changes. Tell the user to save it first (File > Save) or to start a new design with the File menu, which asks.".to_string();
+            }
             match app.run(command, params.unwrap_or_else(|| json!({}))) {
-                Ok(r) => clip(r.to_string()),
+                Ok(r) => short_result(&r),
                 Err(e) => clip(format!("error: {e}")),
             }
         }
+        Some("round") => round_edges(app, &v),
         Some("inspect") => {
             let state = app.session.world_state();
             let bodies: Vec<String> = state.bodies.iter().take(60).map(|b| format!("{}{}", b.name, if app.session.body_visible(&b.name) { "" } else { " (hidden)" })).collect();
@@ -258,6 +326,10 @@ impl State {
                     let prompt = std::mem::take(&mut self.input);
                     self.log.push(format!("You: {prompt}"));
                     self.busy = true;
+                    if let Ok(b) = self.bridge() {
+                        // Each request starts clean: the design is the memory, and the model's own is small.
+                        (b.reset)();
+                    }
                     if let (Ok(b), Ok(c)) = (self.bridge(), CString::new(prompt.replace('\0', " "))) {
                         (b.ask)(c.as_ptr(), done_cb);
                     }
