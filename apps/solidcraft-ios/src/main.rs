@@ -8,6 +8,8 @@
 
 mod files;
 #[cfg(target_os = "ios")]
+mod keyboard;
+#[cfg(target_os = "ios")]
 mod picker;
 
 use solidcraft_engine::Session;
@@ -56,10 +58,22 @@ impl eframe::App for App {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Inside the status bar, the home indicator and any rounded corners.
-        let safe = ui.ctx().content_rect();
+        #[allow(unused_mut)]
+        let mut safe = ui.ctx().content_rect();
+        // A docked keyboard covers the bottom: the UI sits above it, so the field being typed in
+        // is never hidden (a floating or split keyboard leaves the layout alone).
+        #[cfg(target_os = "ios")]
+        {
+            keyboard::install();
+            let covered = (keyboard::covered() - ui.ctx().input(|i| i.safe_area_insets().0.bottom)).max(0.0);
+            safe.max.y = (safe.max.y - covered).max(safe.min.y + 200.0);
+        }
         let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(safe));
         inner.set_clip_rect(safe);
         self.solve.ui(&mut inner);
+        // Number fields ask for the number keyboard.
+        #[cfg(target_os = "ios")]
+        keyboard::set_numeric(solidcraft_ui_egui::numeric_focus(ui.ctx()));
         self.files.show(ui.ctx());
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

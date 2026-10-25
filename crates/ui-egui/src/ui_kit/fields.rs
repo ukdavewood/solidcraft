@@ -7,6 +7,14 @@ use super::{
 use crate::{scenario, theme::Tokens};
 use egui::{Response, RichText, Ui, vec2};
 
+/// A number is being typed into `response`: the host may offer a number keyboard
+/// ([`crate::numeric_focus`]). Called by the kit's number and expression fields.
+pub(crate) fn mark_numeric(ctx: &egui::Context, response: &Response) {
+    if response.has_focus() {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(crate::NUMERIC_FOCUS), ctx.cumulative_frame_nr()));
+    }
+}
+
 /// One alignment policy for every kit text input. Align the galley itself rather than
 /// approximating font metrics with integer margins (Plex Mono and Sans differ).
 pub(super) fn text_input(edit: egui::TextEdit<'_>) -> egui::TextEdit<'_> {
@@ -148,6 +156,9 @@ fn editor(ui: &mut Ui, value: &mut String, hint: &str, completion: bool) -> (boo
         text_input(egui::TextEdit::singleline(value)).hint_text(hint).font(font).background_color(t.control_fill).clip_text(true),
     );
     crate::theme::TabAccent::number_focus(ui, &response);
+    if completion {
+        mark_numeric(ui.ctx(), &response);
+    }
     let label = crate::i18n::tr_label(label(ui));
     response.widget_info(|| {
         let mut info = egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), label);
@@ -382,6 +393,7 @@ pub(crate) fn scalar_field(ui: &mut Ui, value: &mut f64, range: std::ops::RangeI
         vec2(dimension(ui.available_width()), row_height()),
         egui::DragValue::new(value).range(range).speed(0.01).custom_parser(crate::prefs::parse_number),
     );
+    mark_numeric(ui.ctx(), &response);
     scenario::publish_target(&format!("dialog:scalar:{}", label(ui)), response.rect);
     response
 }
@@ -390,6 +402,7 @@ pub(crate) fn scalar_field(ui: &mut Ui, value: &mut f64, range: std::ops::RangeI
 /// Tokens: control_height, scope control/font tokens.
 pub(crate) fn length_field(ui: &mut Ui, value: &mut f64, units: &str, decimals: u8) -> Response {
     let response = ui.add(length_drag(value, units, decimals));
+    mark_numeric(ui.ctx(), &response);
     scenario::publish_target(&format!("dialog:length:{}", label(ui)), response.rect);
     response
 }
@@ -397,6 +410,7 @@ pub(crate) fn length_field(ui: &mut Ui, value: &mut f64, units: &str, decimals: 
 /// Angle in degrees, dragged or typed. Tokens: control_height, scope control/font tokens.
 pub(crate) fn angle_field(ui: &mut Ui, value: &mut f64) -> Response {
     let response = ui.add(egui::DragValue::new(value).speed(1.0).suffix(" deg").custom_parser(crate::prefs::parse_number));
+    mark_numeric(ui.ctx(), &response);
     scenario::publish_target(&format!("dialog:angle:{}", label(ui)), response.rect);
     response
 }
@@ -449,6 +463,7 @@ pub(crate) fn number_field<T: egui::emath::Numeric>(
     suffix: &str,
 ) -> Response {
     let response = ui.add(egui::DragValue::new(value).range(range).speed(speed).suffix(suffix).custom_parser(crate::prefs::parse_number));
+    mark_numeric(ui.ctx(), &response);
     response.widget_info(|| {
         let mut info = egui::WidgetInfo::drag_value(ui.is_enabled(), value.to_f64());
         info.label = Some(crate::i18n::tr_label(label(ui)).to_string());

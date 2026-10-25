@@ -131,6 +131,15 @@ pub(crate) mod frame_watch;
 #[cfg(test)]
 mod history_off_thread_tests;
 pub use file_picker::FilePickerFuture;
+
+/// Context key `ui_kit::fields::mark_numeric` writes (the frame a number field had focus).
+pub(crate) const NUMERIC_FOCUS: &str = "solidcraft_numeric_focus";
+
+/// Whether a number or expression field has keyboard focus in this frame, so a host with an
+/// on-screen keyboard can offer its number layout. Read it after the frame's UI has run.
+pub fn numeric_focus(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<u64>(egui::Id::new(NUMERIC_FOCUS))) == Some(ctx.cumulative_frame_nr())
+}
 #[cfg(test)]
 mod blend_arrow_tests;
 #[cfg(test)]
