@@ -6,23 +6,33 @@
 //! scaling follow.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod files;
+
 use solidcraft_engine::Session;
-use solidcraft_ui_egui::{Services, SolveApp};
+use solidcraft_ui_egui::SolveApp;
 
 /// A 32-bit float depth buffer, as on the other apps (reversed-depth viewport).
 const DEPTH_BITS: u8 = 32;
 
 struct App {
     solve: SolveApp,
+    files: files::Files,
     frames: u32,
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.frames < 3 {
+        if self.frames < 4 {
             self.frames += 1;
             let (insets, screen, content) = ctx.input(|i| (i.safe_area_insets(), i.viewport_rect(), i.content_rect()));
             note(&format!("frame {}: insets {insets:?} screen {screen:?} content {content:?}", self.frames));
+        }
+        // Test hook: `SIMCTL_CHILD_SOLIDCRAFT_IOS_TEST=doc.open` starts that command after start-up.
+        if self.frames == 3 {
+            self.frames += 1;
+            if let Ok(id) = std::env::var("SOLIDCRAFT_IOS_TEST") {
+                self.solve.start(&id);
+            }
         }
         self.solve.logic(ctx);
     }
@@ -35,6 +45,7 @@ impl eframe::App for App {
         let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(safe));
         inner.set_clip_rect(safe);
         self.solve.ui(&mut inner);
+        self.files.show(ui.ctx());
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, self.solve.prefs());
@@ -98,7 +109,8 @@ fn run() -> eframe::Result {
         Box::new(|cc| {
             note("creating app");
             solidcraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
-            let mut app = SolveApp::new(Session::default(), Services::default());
+            let files = files::Files::default();
+            let mut app = SolveApp::new(Session::default(), files.services());
             if let Some(rs) = &cc.wgpu_render_state {
                 app.set_wgpu(rs, DEPTH_BITS, 0, rs.msaa_samples);
                 solidcraft_ui_egui::gpu::install_picture_renderer(rs);
@@ -107,7 +119,7 @@ fn run() -> eframe::Result {
                 app.set_status(format!("sample: {e}"), true);
             }
             note("app created");
-            Ok(Box::new(App { solve: app, frames: 0 }))
+            Ok(Box::new(App { solve: app, files, frames: 0 }))
         }),
     )
 }
