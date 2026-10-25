@@ -222,7 +222,17 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
         }
         Some("run") => {
             let command = v.get("command").and_then(Value::as_str).unwrap_or("");
-            let params = v.get("params").and_then(Value::as_str).and_then(|p| serde_json::from_str::<Value>(p).ok()).filter(Value::is_object);
+            // Parameters arrive as a JSON object, or as JSON text: a small model writes the text
+            // badly, so `view.show_hide` also takes whatever follows `rule:`.
+            let params = match v.get("params") {
+                Some(o) if o.is_object() => Some(o.clone()),
+                Some(t) => t.as_str().and_then(|p| serde_json::from_str::<Value>(p).ok()).filter(Value::is_object).or_else(|| {
+                    let text = t.as_str()?.trim();
+                    (command == "view.show_hide" && !text.is_empty())
+                        .then(|| json!({ "rule": text.trim_start_matches("rule").trim_start_matches(':').trim().trim_matches('"') }))
+                }),
+                None => None,
+            };
             // Starting or opening another design drops what is on screen: not while it holds
             // unsaved changes (the user saves first, or says so, and the app's own New asks).
             if ["file.new", "doc.open"].contains(&command) && app.session.is_dirty() {
@@ -234,6 +244,30 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             }
         }
         Some("round") => round_edges(app, &v),
+        Some("shape") => {
+            let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite() && *x > 0.0);
+            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            let (cmd, params) = match kind.as_str() {
+                k if ["box", "cube", "block", "cuboid"].contains(&k) => {
+                    let (l, w, h) = (n("a"), n("b").or(n("a")), n("c").or(n("a")));
+                    let (Some(l), Some(w), Some(h)) = (l, w, h) else { return "error: a box needs a size in millimetres".to_string() };
+                    ("solid.box", json!({ "length": l, "width": w, "height": h }))
+                }
+                k if ["cylinder", "rod", "tube"].contains(&k) => {
+                    let (Some(r), Some(h)) = (n("a"), n("b")) else { return "error: a cylinder needs a radius and a height in millimetres".to_string() };
+                    ("solid.cylinder", json!({ "radius": r, "height": h }))
+                }
+                k if ["sphere", "ball"].contains(&k) => {
+                    let Some(r) = n("a") else { return "error: a sphere needs a radius in millimetres".to_string() };
+                    ("solid.sphere", json!({ "radius": r }))
+                }
+                _ => return "error: kind must be box, cylinder or sphere".to_string(),
+            };
+            match app.run(cmd, params) {
+                Ok(r) => short_result(&r),
+                Err(e) => clip(format!("error: {e}")),
+            }
+        }
         Some("inspect") => {
             let state = app.session.world_state();
             let bodies: Vec<String> = state.bodies.iter().take(60).map(|b| format!("{}{}", b.name, if app.session.body_visible(&b.name) { "" } else { " (hidden)" })).collect();
