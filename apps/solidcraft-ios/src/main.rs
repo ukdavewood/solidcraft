@@ -8,6 +8,8 @@
 
 mod files;
 #[cfg(target_os = "ios")]
+mod ai;
+#[cfg(target_os = "ios")]
 mod keyboard;
 #[cfg(target_os = "ios")]
 mod picker;
@@ -21,6 +23,8 @@ const DEPTH_BITS: u8 = 32;
 struct App {
     solve: SolveApp,
     files: files::Files,
+    #[cfg(target_os = "ios")]
+    ai: ai::State,
     frames: u32,
     synced_at: f64,
 }
@@ -51,6 +55,8 @@ impl eframe::App for App {
             }
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        #[cfg(target_os = "ios")]
+        self.ai.tick(&mut self.solve);
         self.solve.logic(ctx);
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -75,6 +81,8 @@ impl eframe::App for App {
         #[cfg(target_os = "ios")]
         keyboard::set_numeric(solidcraft_ui_egui::numeric_focus(ui.ctx()));
         self.files.show(ui.ctx());
+        #[cfg(target_os = "ios")]
+        self.ai.show(ui.ctx());
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, self.solve.prefs());
@@ -161,7 +169,14 @@ fn run() -> eframe::Result {
                 app.set_status(format!("sample: {e}"), true);
             }
             note("app created");
-            Ok(Box::new(App { solve: app, files, frames: 0, synced_at: 0.0 }))
+            Ok(Box::new(App {
+                solve: app,
+                files,
+                #[cfg(target_os = "ios")]
+                ai: ai::State::default(),
+                frames: 0,
+                synced_at: 0.0,
+            }))
         }),
     )
 }
