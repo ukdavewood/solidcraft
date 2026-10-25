@@ -16,6 +16,7 @@ use solidcraft_ui_egui::SolveApp;
 
 type ExecFn = extern "C" fn(*const c_char) -> *mut c_char;
 type DoneFn = extern "C" fn(*const c_char);
+type TextFn = extern "C" fn(*const c_char, i32);
 
 /// Requests from the model's tools: the JSON text and where the answer goes.
 static REQUESTS: Mutex<Vec<(String, mpsc::Sender<String>)>> = Mutex::new(Vec::new());
@@ -23,6 +24,8 @@ static REQUESTS: Mutex<Vec<(String, mpsc::Sender<String>)>> = Mutex::new(Vec::ne
 static ANSWERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// What the model's tools did, for the window (so a wrong turn can be seen).
 static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Words from the microphone: the text and its kind (0 so far, 1 final, 2 an error).
+static SPOKEN: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 /// The longest tool answer: the model's context is small.
@@ -57,11 +60,22 @@ extern "C" fn done_cb(answer: *const c_char) {
     repaint();
 }
 
+extern "C" fn spoken_cb(text: *const c_char, kind: i32) {
+    // SAFETY: as above.
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+    if let Ok(mut s) = SPOKEN.lock() {
+        s.push((text, kind));
+    }
+    repaint();
+}
+
 /// The framework's entry points.
 struct Bridge {
     ask: extern "C" fn(*const c_char, DoneFn),
     reset: extern "C" fn(),
     availability: extern "C" fn() -> *mut c_char,
+    listen_start: extern "C" fn(TextFn),
+    listen_stop: extern "C" fn(),
 }
 
 fn load() -> Result<Bridge, String> {
@@ -90,6 +104,8 @@ fn load() -> Result<Bridge, String> {
             ask: std::mem::transmute(sym(c"sc_ai_ask")?),
             reset: std::mem::transmute(sym(c"sc_ai_reset")?),
             availability: std::mem::transmute(sym(c"sc_ai_availability")?),
+            listen_start: std::mem::transmute(sym(c"sc_ai_listen_start")?),
+            listen_stop: std::mem::transmute(sym(c"sc_ai_listen_stop")?),
         })
     }
 }
@@ -285,6 +301,7 @@ pub struct State {
     input: String,
     log: Vec<String>,
     busy: bool,
+    listening: bool,
     bridge: Option<Result<Bridge, String>>,
     availability: String,
 }
@@ -334,6 +351,19 @@ impl State {
         for line in TRACE.lock().map(|mut t| std::mem::take(&mut *t)).unwrap_or_default() {
             self.log.push(line);
         }
+        for (text, kind) in SPOKEN.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default() {
+            match kind {
+                2 => {
+                    self.listening = false;
+                    self.log.push(text);
+                }
+                1 => {
+                    self.listening = false;
+                    self.input = text;
+                }
+                _ => self.input = text,
+            }
+        }
         let answers: Vec<_> = ANSWERS.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
         for a in answers {
             self.busy = false;
@@ -357,7 +387,7 @@ impl State {
                 Ok(_) => self.availability.clone(),
                 Err(e) => format!("not available: {e}"),
             };
-            ui.label(egui::RichText::new(status).weak());
+            ui.label(egui::RichText::new(if self.listening { format!("{status} · listening…") } else { status }).weak());
             egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).show(ui, |ui| {
                 for line in &self.log {
                     ui.label(line);
@@ -375,6 +405,18 @@ impl State {
                 let ready = !self.busy && !self.input.trim().is_empty() && self.availability == "available";
                 if (ui.add_enabled(ready, egui::Button::new("Ask")).clicked() || (enter && ready)) && ready {
                     self.submit();
+                }
+                let speak = if self.listening { "Stop" } else { "Speak" };
+                if ui.button(speak).clicked() {
+                    let was_listening = self.listening;
+                    if let Ok(b) = self.bridge() {
+                        if was_listening {
+                            (b.listen_stop)();
+                        } else {
+                            (b.listen_start)(spoken_cb);
+                        }
+                        self.listening = !was_listening;
+                    }
                 }
                 if ui.button("New chat").clicked() {
                     self.log.clear();
