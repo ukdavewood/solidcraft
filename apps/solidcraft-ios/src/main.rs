@@ -20,6 +20,7 @@ struct App {
     solve: SolveApp,
     files: files::Files,
     frames: u32,
+    synced_at: f64,
 }
 
 impl eframe::App for App {
@@ -35,6 +36,18 @@ impl eframe::App for App {
             if let Ok(id) = std::env::var("SOLIDCRAFT_IOS_TEST") {
                 self.solve.start(&id);
             }
+        }
+        // Saves of a file opened from iCloud Drive (or another folder) are written back to it.
+        #[cfg(target_os = "ios")]
+        if picker::linked() {
+            let now = ctx.input(|i| i.time);
+            if now - self.synced_at >= 1.0 {
+                self.synced_at = now;
+                for (text, error) in picker::sync() {
+                    self.solve.set_status(text, error);
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         self.solve.logic(ctx);
     }
@@ -134,7 +147,7 @@ fn run() -> eframe::Result {
                 app.set_status(format!("sample: {e}"), true);
             }
             note("app created");
-            Ok(Box::new(App { solve: app, files, frames: 0 }))
+            Ok(Box::new(App { solve: app, files, frames: 0, synced_at: 0.0 }))
         }),
     )
 }
