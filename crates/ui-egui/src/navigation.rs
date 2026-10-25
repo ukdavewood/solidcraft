@@ -478,7 +478,13 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
         // Ctrl+left drag from empty space orbits in every preset (Cmd on macOS). A Ctrl+click
         // still selects, and Ctrl on geometry still drags it without snapping.
         let ctrl_orbit = (mods.ctrl || mods.command) && !mods.shift && !mods.alt && empty_space(app);
-        app.viewport.primary_nav = preset.or(ctrl_orbit.then_some(NavMode::Orbit));
+        // A finger that lands on empty space orbits (a touch screen has no modifier keys or other
+        // buttons to ask for it); on the model it still selects and drags, and tools keep it.
+        let finger_orbit = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Touch { phase: egui::TouchPhase::Start, .. })))
+            && app.tool.is_none()
+            && app.dialog.is_none()
+            && empty_space(app);
+        app.viewport.primary_nav = preset.or((ctrl_orbit || finger_orbit).then_some(NavMode::Orbit));
     } else if !primary_down && !primary_released {
         app.viewport.primary_nav = None;
     }

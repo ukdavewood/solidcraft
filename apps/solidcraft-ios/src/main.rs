@@ -102,7 +102,17 @@ fn run() -> eframe::Result {
             d
         });
     }
-    let options = eframe::NativeOptions { depth_buffer: DEPTH_BITS, wgpu_options, ..Default::default() };
+    // Settings live in the app's Library folder (the platform has no data directory std can find).
+    let library = std::env::temp_dir().parent().map(|p| p.join("Library"));
+    if let Some(dir) = &library {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let options = eframe::NativeOptions {
+        depth_buffer: DEPTH_BITS,
+        wgpu_options,
+        persistence_path: library.map(|d| d.join("app.ron")),
+        ..Default::default()
+    };
     eframe::run_native(
         "SolidCraft",
         options,
@@ -111,6 +121,9 @@ fn run() -> eframe::Result {
             solidcraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
             let files = files::Files::default();
             let mut app = SolveApp::new(Session::default(), files.services());
+            if let Some(prefs) = cc.storage.and_then(|s| solidcraft_ui_egui::prefs::stored(|k| s.get_string(k))) {
+                app.load_prefs(&prefs);
+            }
             if let Some(rs) = &cc.wgpu_render_state {
                 app.set_wgpu(rs, DEPTH_BITS, 0, rs.msaa_samples);
                 solidcraft_ui_egui::gpu::install_picture_renderer(rs);
