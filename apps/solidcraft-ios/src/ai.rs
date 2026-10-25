@@ -310,6 +310,20 @@ impl State {
         }
     }
 
+    /// Send what is typed to the model.
+    fn submit(&mut self) {
+        let prompt = std::mem::take(&mut self.input);
+        self.log.push(format!("You: {prompt}"));
+        self.busy = true;
+        if let Ok(b) = self.bridge() {
+            // Each request starts clean: the design is the memory, and the model's own is small.
+            (b.reset)();
+            if let Ok(c) = CString::new(prompt.trim().replace('\0', " ")) {
+                (b.ask)(c.as_ptr(), done_cb);
+            }
+        }
+    }
+
     /// Answer the model's requests and take in its answers (the UI thread, once a frame).
     pub fn tick(&mut self, app: &mut SolveApp) {
         let requests: Vec<_> = REQUESTS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
@@ -353,20 +367,14 @@ impl State {
                 }
             });
             ui.separator();
-            ui.add(egui::TextEdit::multiline(&mut self.input).desired_rows(2).desired_width(f32::INFINITY).hint_text("Ask SolidCraft to do something"));
+            // Enter asks; Shift+Enter is a new line.
+            let id = egui::Id::new("ai_input");
+            let enter = ui.memory(|m| m.has_focus(id)) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            ui.add(egui::TextEdit::multiline(&mut self.input).id(id).desired_rows(2).desired_width(f32::INFINITY).hint_text("Ask SolidCraft to do something"));
             ui.horizontal(|ui| {
                 let ready = !self.busy && !self.input.trim().is_empty() && self.availability == "available";
-                if ui.add_enabled(ready, egui::Button::new("Ask")).clicked() {
-                    let prompt = std::mem::take(&mut self.input);
-                    self.log.push(format!("You: {prompt}"));
-                    self.busy = true;
-                    if let Ok(b) = self.bridge() {
-                        // Each request starts clean: the design is the memory, and the model's own is small.
-                        (b.reset)();
-                    }
-                    if let (Ok(b), Ok(c)) = (self.bridge(), CString::new(prompt.replace('\0', " "))) {
-                        (b.ask)(c.as_ptr(), done_cb);
-                    }
+                if (ui.add_enabled(ready, egui::Button::new("Ask")).clicked() || (enter && ready)) && ready {
+                    self.submit();
                 }
                 if ui.button("New chat").clicked() {
                     self.log.clear();
