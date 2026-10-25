@@ -21,6 +21,8 @@ type DoneFn = extern "C" fn(*const c_char);
 static REQUESTS: Mutex<Vec<(String, mpsc::Sender<String>)>> = Mutex::new(Vec::new());
 /// Finished answers (or errors) from the model.
 static ANSWERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// What the model's tools did, for the window (so a wrong turn can be seen).
+static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 /// The longest tool answer: the model's context is small.
@@ -106,27 +108,55 @@ fn clip(mut text: String) -> String {
 
 /// Answer one tool request from the model.
 fn handle(app: &mut SolveApp, request: &str) -> String {
+    let reply = answer(app, request);
+    if let Ok(mut t) = TRACE.lock() {
+        t.push(format!("· {} → {}", request.chars().take(160).collect::<String>(), reply.chars().take(100).collect::<String>()));
+    }
+    reply
+}
+
+fn answer(app: &mut SolveApp, request: &str) -> String {
     let v: Value = serde_json::from_str(request).unwrap_or(Value::Null);
     match v.get("tool").and_then(Value::as_str) {
         Some("find") => {
             let query = v.get("query").and_then(Value::as_str).unwrap_or("").to_lowercase();
-            let words: Vec<&str> = query.split_whitespace().collect();
+            // Everyday words for what the commands call something else.
+            let mut words: Vec<String> = Vec::new();
+            for w in query.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1) {
+                let mapped = match w {
+                    "cube" | "block" | "cuboid" | "brick" | "square" | "rectangular" => "box",
+                    "ball" | "globe" => "sphere",
+                    "rod" | "tube" | "can" | "pillar" | "column" | "cylindrical" => "cylinder",
+                    "round" | "rounded" | "rounding" => "fillet",
+                    "bevel" => "chamfer",
+                    "remove" | "erase" => "delete",
+                    "dimension" | "size" | "value" => "parameters",
+                    other => other,
+                };
+                words.push(mapped.to_string());
+            }
             let listed = app.run("engine.commands", json!({})).unwrap_or(Value::Null);
             let all = listed.as_array().or_else(|| listed.get("commands").and_then(Value::as_array)).cloned().unwrap_or_default();
-            let mut hits: Vec<(usize, String)> = all
+            // Matches in the id or label count more than matches in the parameter text.
+            let mut hits: Vec<(std::cmp::Reverse<usize>, usize, String)> = all
                 .iter()
                 .filter_map(|c| {
                     let id = c.get("id")?.as_str()?;
                     let label = c.get("label").and_then(Value::as_str).unwrap_or("");
                     let params = c.get("params").and_then(Value::as_str).unwrap_or("");
-                    let hay = format!("{id} {label} {params}").to_lowercase();
-                    let score = words.iter().filter(|w| hay.contains(**w)).count();
-                    (score > 0 && score == words.len()).then(|| (id.len(), format!("{id} | {label} | {}", params.chars().take(220).collect::<String>())))
+                    let name = format!("{id} {label}").to_lowercase();
+                    let params_lc = params.to_lowercase();
+                    let score: usize = words.iter().map(|w| if name.contains(w.as_str()) { 3 } else { usize::from(params_lc.contains(w.as_str())) }).sum();
+                    (score > 0).then(|| (std::cmp::Reverse(score), id.len(), format!("{id} | {label} | {}", params.chars().take(220).collect::<String>())))
                 })
                 .collect();
             hits.sort();
             hits.truncate(5);
-            if hits.is_empty() { "no command matches; try other keywords".to_string() } else { clip(hits.into_iter().map(|h| h.1).collect::<Vec<_>>().join("\n")) }
+            if hits.is_empty() {
+                "no command matches; for shapes use solid.box, solid.cylinder or solid.sphere".to_string()
+            } else {
+                clip(hits.into_iter().map(|h| h.2).collect::<Vec<_>>().join("\n"))
+            }
         }
         Some("run") => {
             let command = v.get("command").and_then(Value::as_str).unwrap_or("");
@@ -184,6 +214,9 @@ impl State {
         for (text, tx) in requests {
             let reply = handle(app, &text);
             let _ = tx.send(reply);
+        }
+        for line in TRACE.lock().map(|mut t| std::mem::take(&mut *t)).unwrap_or_default() {
+            self.log.push(line);
         }
         let answers: Vec<_> = ANSWERS.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
         for a in answers {
