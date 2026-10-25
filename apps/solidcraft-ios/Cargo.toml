@@ -1,0 +1,21 @@
+[package]
+name = "solidcraft-ios"
+description = "SolidCraft for iPad and iPhone (eframe on winit's iOS backend, wgpu/Metal)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "solidcraft-ios"
+path = "src/main.rs"
+
+[dependencies]
+solidcraft-engine = { workspace = true }
+solidcraft-ui-egui = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
+log = { workspace = true }
