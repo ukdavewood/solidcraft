@@ -513,8 +513,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut hovered = None;
     let mut picked = None;
     let w = crate::context_menu::LIST_W - 10.0;
-    // Title, rows up to the scroll height, margins and border.
-    let size = vec2(w + 10.0, 30.0 + (p.rows.len() as f32 * 24.0).min(360.0));
+    // Title, rows up to the scroll height, margins and border. A short display (a phone) gets
+    // fewer rows rather than a list taller than it is.
+    let rows_h = 360.0f32.min(ctx.content_rect().height() - 42.0).max(48.0);
+    let size = vec2(w + 10.0, 30.0 + (p.rows.len() as f32 * 24.0).min(rows_h));
     let resp = crate::frame::area(egui::Id::new("sc_select_other"))
         .fixed_pos(crate::context_menu::place(p.at, vec2(12.0, 12.0), size, ctx.content_rect()))
         .constrain(true)
@@ -531,7 +533,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     FontId::proportional(crate::theme::Tokens::get().font_panel),
                     t.text_dim,
                 );
-                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(rows_h).show(ui, |ui| {
                     for (i, row) in p.rows.iter().enumerate() {
                         let (r, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::click());
                         crate::scenario::publish_handle(&format!("select_other:{i}"), r.center());

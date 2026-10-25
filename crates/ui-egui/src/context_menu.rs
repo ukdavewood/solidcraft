@@ -1708,6 +1708,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let pointer = ctx.input(|i| i.pointer.latest_pos());
     let mut inside = app.menu.opener.is_some_and(|r| pointer.is_some_and(|p| r.contains(p)));
 
+    // A list taller than the screen (a phone, a short window) scrolls instead of running off
+    // it: the menu is placed with the height it will draw, so it lands where it can be reached.
+    let list_h = list_height(&list).min(screen.height() - 12.0).max(80.0);
     let list_at = if target == Target::Workspace {
         pos2(at.x.clamp(screen.left(), (screen.right() - 470.0).max(screen.left())), at.y)
     } else if app.menu.radial {
@@ -1721,9 +1724,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             picked = crate::ui_kit::radial_menu(ui, c, &radial, hot).or(picked.take());
         });
         inside |= resp.response.contains_pointer();
-        list_place(c, list_height(&list), screen)
+        list_place(c, list_h, screen)
     } else {
-        place(at, Vec2::ZERO, vec2(LIST_W, list_height(&list)), screen)
+        place(at, Vec2::ZERO, vec2(LIST_W, list_h), screen)
     };
 
     let had_submenu = app.menu.submenu.is_some();
@@ -1753,24 +1756,28 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 picked = crate::ui_kit::workspace_menu(ui, &list, key_row, (screen.bottom() - list_at.y).max(160.0)).or(picked.take());
             } else {
                 menu_frame(ui, |ui| {
-                    for (k, item) in list.iter().enumerate() {
-                        if item.children.is_empty() {
-                            if let Some(p) = list_row_lit(ui, item, key_row == Some(k)) {
-                                picked = Some(p);
-                            }
-                        } else {
-                            let row = kit_item(item, key_row == Some(k) || app.menu.submenu == Some(k)).show(ui);
-                            if item.enabled && ((row.hovered() && ctx.input(|i| i.pointer.delta() != Vec2::ZERO)) || row.clicked()) {
-                                if app.menu.submenu != Some(k) {
-                                    app.menu.submenu_key = None;
+                    // A menu taller than the screen scrolls: the rows below the fold are wheeled
+                    // into view instead of being drawn off the display, where nothing reaches them.
+                    egui::ScrollArea::vertical().id_salt("sc_context_menu_list").max_height((list_h - 10.0).max(60.0)).show(ui, |ui| {
+                        for (k, item) in list.iter().enumerate() {
+                            if item.children.is_empty() {
+                                if let Some(p) = list_row_lit(ui, item, key_row == Some(k)) {
+                                    picked = Some(p);
                                 }
-                                app.menu.submenu = Some(k);
-                            }
-                            if app.menu.submenu == Some(k) {
-                                submenu_row = Some((k, row.rect));
+                            } else {
+                                let row = kit_item(item, key_row == Some(k) || app.menu.submenu == Some(k)).show(ui);
+                                if item.enabled && ((row.hovered() && ctx.input(|i| i.pointer.delta() != Vec2::ZERO)) || row.clicked()) {
+                                    if app.menu.submenu != Some(k) {
+                                        app.menu.submenu_key = None;
+                                    }
+                                    app.menu.submenu = Some(k);
+                                }
+                                if app.menu.submenu == Some(k) {
+                                    submenu_row = Some((k, row.rect));
+                                }
                             }
                         }
-                    }
+                    });
                 });
             }
         });
@@ -1932,6 +1939,40 @@ mod tests {
         assert_eq!(describe(&h.app)["radial"].as_array().unwrap().len(), DIRS);
         open_for(&mut h.app, pos2(point[0] as f32, point[1] as f32), Target::Origin);
         assert!(!h.app.menu.radial, "browser menus remain lists when radial menus are enabled");
+    }
+
+    /// A menu taller than the screen (a phone, a short window) is held to the screen and
+    /// scrolls: a row below the fold can be wheeled into view instead of being drawn off it.
+    #[test]
+    fn a_menu_taller_than_the_screen_scrolls_into_view() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.settle();
+        h.call("ui.resize", json!({"width":900.0,"height":130.0}));
+        h.settle();
+        let point = h.at(&json!({"world":[0,0,0]})).unwrap();
+        h.step(&json!({"click":point,"button":"right"})).unwrap();
+        assert!(h.app.viewport.context_menu.is_some());
+        let screen = h.ctx.content_rect();
+        let id = egui::Id::new("sc_context_menu");
+        let area = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+        assert!(area.height() <= screen.height(), "the menu is held to the screen: {area:?} in {screen:?}");
+        assert!(screen.expand(1.0).contains_rect(area), "{area:?} outside {screen:?}");
+        // Its last row is past the fold: a wheel over the menu brings it in.
+        let ids: Vec<String> = describe(&h.app)["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["id"].as_str().filter(|s| !s.is_empty()).map(str::to_string))
+            .collect();
+        let last = ids.last().expect("a menu with rows").clone();
+        let handle = format!("menu:{last}");
+        let before = crate::scenario::handle_at(&handle).expect("the last row is drawn");
+        assert!(before.y > area.bottom() - 22.0, "the last row starts past the fold: {before:?} in {area:?}");
+        h.call("ui.scroll", json!({"x": area.center().x, "y": screen.center().y, "delta": -600.0}));
+        h.frames(6);
+        let after = crate::scenario::handle_at(&handle).expect("the last row is drawn");
+        assert!(area.contains(after), "the last row scrolled into the menu: {after:?}");
     }
 
     #[test]
