@@ -107,10 +107,10 @@ fn round_edges(app: &mut SolveApp, v: &Value) -> String {
     let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
     let size = v.get("size").and_then(Value::as_f64).filter(|s| s.is_finite() && *s > 0.0);
     let Some(size) = size else { return "error: size must be a positive number of millimetres".to_string() };
-    let body = match text("body") {
-        b if !b.is_empty() => app.session.world_state().bodies.iter().find(|x| x.name.to_lowercase() == b).map(|x| x.name.clone()),
-        _ => app.session.world_state().bodies.last().map(|x| x.name.clone()),
-    };
+    // A named body when there is one; "newest", "last", an empty or an unknown name mean the newest.
+    let named = text("body");
+    let state = app.session.world_state();
+    let body = state.bodies.iter().find(|x| !named.is_empty() && x.name.to_lowercase() == named).or_else(|| state.bodies.iter().rev().find(|x| app.session.body_visible(&x.name))).or(state.bodies.last()).map(|x| x.name.clone());
     let Some(body) = body else { return "error: no such body (use inspect_design for the names)".to_string() };
     let listed = match app.run("model.edges", json!({ "body": body })) {
         Ok(l) => l,
@@ -271,7 +271,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
         Some("inspect") => {
             let state = app.session.world_state();
             let bodies: Vec<String> = state.bodies.iter().take(60).map(|b| format!("{}{}", b.name, if app.session.body_visible(&b.name) { "" } else { " (hidden)" })).collect();
-            let params: Vec<String> = app.session.doc.params.iter().take(30).map(|p| format!("{}={} {}", p.name, p.expr, p.unit)).collect();
+            let params: Vec<String> = app.session.doc.params.iter().take(30).map(|p| format!("{}={}", p.name, if p.unit.is_empty() || p.expr.contains(p.unit.as_str()) { p.expr.clone() } else { format!("{} {}", p.expr, p.unit) })).collect();
             clip(format!("bodies ({}): {}\nparameters: {}", state.bodies.len(), bodies.join(", "), params.join("; ")))
         }
         _ => "error: unknown request".to_string(),

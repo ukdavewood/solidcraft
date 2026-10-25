@@ -60,6 +60,19 @@ impl eframe::App for App {
         self.solve.logic(ctx);
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // The software keyboard's Return, as an Enter key press and release.
+        #[cfg(target_os = "ios")]
+        for _ in 0..keyboard::take_returns() {
+            for pressed in [true, false] {
+                raw.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
         self.solve.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -70,7 +83,7 @@ impl eframe::App for App {
         // is never hidden (a floating or split keyboard leaves the layout alone).
         #[cfg(target_os = "ios")]
         {
-            keyboard::install();
+            keyboard::install(ui.ctx());
             let covered = (keyboard::covered() - ui.ctx().input(|i| i.safe_area_insets().0.bottom)).max(0.0);
             safe.max.y = (safe.max.y - covered).max(safe.min.y + 200.0);
         }
