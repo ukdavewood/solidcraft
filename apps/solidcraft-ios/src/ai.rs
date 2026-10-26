@@ -423,7 +423,8 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
         Some("escalate") => "no tool can do this request: it needs a more capable assistant. Call no more tools and reply \"Handing over.\"".to_string(),
         Some("round") => round_edges(app, &v),
         Some("move") => {
-            let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(0.0);
+            // A number, or text holding one (a replayed recipe writes "-20").
+            let n = |k: &str| v.get(k).and_then(|x| x.as_f64().or_else(|| x.as_str()?.trim().parse().ok())).filter(|x| x.is_finite()).unwrap_or(0.0);
             let named = v.get("body").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
             let state = app.session.world_state();
             let body = state
@@ -443,7 +444,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             // The on-device model adds a cube for "move the cube": shapes only come from add/create/make.
             let asked = APPLE_REQUEST.lock().ok().and_then(|a| a.clone());
             if asked.is_some_and(|r| !r.split(' ').any(|w| matches!(w, "add" | "create" | "make" | "build" | "new" | "draw" | "insert" | "place" | "put" | "another"))) {
-                return "refused: the user did not ask to add a shape. To move, round or change something, use the tool for that on the existing body (inspect_design lists the bodies). Do not call again.".to_string();
+                return "refused: the user did not ask to add a shape. Moving means move_body on the existing body and rounding means fillet_edges: call that tool, with the body name from inspect_design if you need it.".to_string();
             }
             let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite() && *x > 0.0);
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("").to_lowercase();
@@ -587,6 +588,10 @@ enum ScriptItem {
     Pause(u64),
     /// A named marker written to the log, to find a take afterwards.
     Take(String),
+    /// Fold the "Demo script" section away, so the window is smaller and looks less automated.
+    Collapse,
+    /// Move the camera (the `change_view` actions) without typing anything.
+    View(String, f64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -604,6 +609,9 @@ struct ScriptRun {
     typed: usize,
     phase: ScriptPhase,
     until: u64,
+    /// Collapse and camera moves passed over, for the next frame to carry out.
+    collapse: bool,
+    views: Vec<(String, f64)>,
 }
 
 /// `Documents/ai/ai-script.txt`: one prompt per line; `#` comments; `[claude]` or `[local]` before a prompt
@@ -617,6 +625,11 @@ fn parse_script(text: &str) -> Vec<ScriptItem> {
                 ScriptItem::Pause((rest.trim().parse::<f64>().unwrap_or(1.0).clamp(0.0, 60.0) * 1000.0) as u64)
             } else if let Some(rest) = l.strip_prefix("@take") {
                 ScriptItem::Take(rest.trim().to_string())
+            } else if l.starts_with("@collapse") {
+                ScriptItem::Collapse
+            } else if let Some(rest) = l.strip_prefix("@view") {
+                let mut words = rest.split_whitespace();
+                ScriptItem::View(words.next().unwrap_or("fit").to_string(), words.next().and_then(|n| n.parse().ok()).unwrap_or(0.0))
             } else if let Some(rest) = l.strip_prefix("[claude]") {
                 ScriptItem::Say { text: rest.trim().to_string(), route: "claude" }
             } else if let Some(rest) = l.strip_prefix("[local]") {
@@ -632,6 +645,10 @@ fn parse_script(text: &str) -> Vec<ScriptItem> {
 pub struct State {
     script: Option<ScriptRun>,
     script_poll: u64,
+    /// Fold the Demo script section on the next frame.
+    collapse_demo: bool,
+    /// Camera moves from a script, made on the next tick.
+    view_queue: Vec<(String, f64)>,
     /// The on-device model's steps to undo, then the request to hand over: (steps, request, "claude" or "local").
     after_undo: Option<(usize, String, &'static str)>,
     hints: Hints,
@@ -817,8 +834,9 @@ fn undoable(call: &Value, reply: &str) -> bool {
         self.input.clear();
         ai_data::log(&json!({ "kind": "script", "event": "start", "t": ai_data::now_millis() / 1000 }));
         self.log.push(format!("· Playing the script ({} lines)", items.len()));
-        let mut run = ScriptRun { items, index: 0, typed: 0, phase: ScriptPhase::Gap, until: ai_data::now_millis() + 800 };
+        let mut run = ScriptRun { items, index: 0, typed: 0, phase: ScriptPhase::Gap, until: ai_data::now_millis() + 800, collapse: false, views: Vec::new() };
         Self::script_skip(&mut run);
+        self.script_actions(&mut run);
         self.script = Some(run);
     }
 
@@ -828,12 +846,22 @@ fn undoable(call: &Value, reply: &str) -> bool {
             match item {
                 ScriptItem::Pause(ms) => run.until = run.until.max(ai_data::now_millis()) + ms,
                 ScriptItem::Take(name) => ai_data::log(&json!({ "kind": "take", "name": name, "t": ai_data::now_millis() / 1000, "id": ai_data::now_millis() })),
+                ScriptItem::Collapse => run.collapse = true,
+                ScriptItem::View(action, amount) => run.views.push((action.clone(), *amount)),
                 ScriptItem::Say { .. } => break,
             }
             run.index += 1;
         }
         run.typed = 0;
         run.phase = ScriptPhase::Typing;
+    }
+
+    /// Carry out what the script asked for besides typing.
+    fn script_actions(&mut self, run: &mut ScriptRun) {
+        if std::mem::take(&mut run.collapse) {
+            self.collapse_demo = true;
+        }
+        self.view_queue.append(&mut run.views);
     }
 
     /// One step of the script: a character, a pause, or sending the prompt (called every frame).
@@ -896,6 +924,7 @@ fn undoable(call: &Value, reply: &str) -> bool {
             ScriptPhase::Gap => {
                 run.index += 1;
                 Self::script_skip(&mut run);
+                self.script_actions(&mut run);
             }
         }
         self.script = Some(run);
@@ -1091,6 +1120,9 @@ fn undoable(call: &Value, reply: &str) -> bool {
 
     /// Answer the model's requests and take in its answers (the UI thread, once a frame).
     pub fn tick(&mut self, app: &mut SolveApp) {
+        for (action, amount) in std::mem::take(&mut self.view_queue) {
+            change_view(app, &json!({ "action": action, "amount": amount }));
+        }
         // A hand-over starts from the design as it was before the on-device model touched it.
         if let Some((steps, request, tier)) = self.after_undo.take() {
             for _ in 0..steps {
@@ -1250,7 +1282,8 @@ fn undoable(call: &Value, reply: &str) -> bool {
                     }
                 });
             }
-            ui.collapsing("Demo script", |ui| {
+            let demo_open = if std::mem::take(&mut self.collapse_demo) { Some(false) } else { None };
+            egui::CollapsingHeader::new("Demo script").open(demo_open).show(ui, |ui| {
                 ui.label("Plays the prompts in Files > SolidCraft > ai > ai-script.txt: each is typed in and sent, one after another.");
                 if let Some(run) = &self.script {
                     ui.label(format!("Playing: line {} of {}", run.index + 1, run.items.len()));
