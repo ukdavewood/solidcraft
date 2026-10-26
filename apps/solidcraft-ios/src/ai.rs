@@ -409,7 +409,7 @@ struct Current {
     calls: Vec<(Value, String)>,
 }
 
-/// The last request, waiting to be rated Good or Bad.
+/// The last request, waiting to be rated.
 struct Rated {
     id: u64,
     request: String,
@@ -593,24 +593,28 @@ impl State {
         self.last = Some(Rated { id: cur.id, request: cur.request, tier: cur.tier, calls: cur.calls.into_iter().map(|(c, _)| c).collect(), clean });
     }
 
-    /// Good or Bad for the last request: logged, and a Good one from the model is remembered.
-    fn rate(&mut self, good: bool) {
+    /// Good, Partly or Poor for the last request: logged, and a Good one from the model is remembered.
+    fn rate(&mut self, value: &str) {
         let Some(r) = self.last.take() else { return };
-        ai_data::log(&json!({ "kind": "feedback", "id": r.id, "t": ai_data::now_millis() / 1000, "value": if good { "good" } else { "bad" } }));
-        if good {
-            if (r.tier == "apple" || r.tier == "claude") && r.clean {
-                // Only the calls that changed something: looking things up is not part of a recipe.
-                let changing: Vec<Value> = r.calls.iter().filter(|c| !matches!(c.get("tool").and_then(Value::as_str), Some("find" | "inspect"))).cloned().collect();
-                self.hints.learn(&r.request, &changing);
-                self.log.push("· Good: remembered, the same request now runs at once".to_string());
-            } else {
-                self.log.push("· Good".to_string());
+        ai_data::log(&json!({ "kind": "feedback", "id": r.id, "t": ai_data::now_millis() / 1000, "value": value }));
+        match value {
+            "good" => {
+                if (r.tier == "apple" || r.tier == "claude") && r.clean {
+                    // Only the calls that changed something: looking things up is not part of a recipe.
+                    let changing: Vec<Value> = r.calls.iter().filter(|c| !matches!(c.get("tool").and_then(Value::as_str), Some("find" | "inspect"))).cloned().collect();
+                    self.hints.learn(&r.request, &changing);
+                    self.log.push("· Good: remembered, the same request now runs at once".to_string());
+                } else {
+                    self.log.push("· Good".to_string());
+                }
             }
-        } else {
-            if r.tier == "learned" {
-                self.hints.forget(&r.request);
+            "partial" => self.log.push("· Partly: logged for review, not remembered".to_string()),
+            _ => {
+                if r.tier == "learned" {
+                    self.hints.forget(&r.request);
+                }
+                self.log.push("· Poor: logged for review".to_string());
             }
-            self.log.push("· Bad: logged for review".to_string());
         }
     }
 
@@ -696,10 +700,13 @@ impl State {
                 ui.horizontal(|ui| {
                     ui.label("Was that right?");
                     if ui.button("Good").clicked() {
-                        self.rate(true);
+                        self.rate("good");
                     }
-                    if ui.button("Bad").clicked() {
-                        self.rate(false);
+                    if ui.button("Partly").clicked() {
+                        self.rate("partial");
+                    }
+                    if ui.button("Poor").clicked() {
+                        self.rate("poor");
                     }
                 });
             }
