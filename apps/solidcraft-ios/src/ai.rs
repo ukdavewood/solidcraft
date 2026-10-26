@@ -30,7 +30,12 @@ static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SPOKEN: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 /// The tool calls of the request being answered, as sent and as answered, for the log.
 static CALLS: Mutex<Vec<(Value, String)>> = Mutex::new(Vec::new());
+/// What the on-device model was asked (normalised), while it is working: it may not start a new design the user did not ask for.
+static APPLE_REQUEST: Mutex<Option<String>> = Mutex::new(None);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
+
+/// Words that end speaking (or cancel a request) instead of being sent as one.
+const STOP_WORDS: &[&str] = &["stop", "stop listening", "cancel", "never mind", "nevermind", "that's all", "thats all", "enough"];
 
 /// The Claude model asked when the on-device model can't (a different one: `claude_model` in the hints file).
 const CLAUDE_MODEL: &str = "claude-haiku-5-5";
@@ -337,6 +342,10 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             };
             // A new design opens in its own tab: the one on screen stays open, so nothing is lost.
             if command == "file.new" {
+                let asked = APPLE_REQUEST.lock().ok().and_then(|a| a.clone());
+                if asked.is_some_and(|r| !r.split(' ').any(|w| matches!(w, "new" | "clear" | "reset" | "start" | "restart" | "empty" | "blank" | "fresh" | "wipe"))) {
+                    return "refused: the user did not ask for a new design. Do not call again.".to_string();
+                }
                 if app.session.is_dirty() || !app.session.world_state().bodies.is_empty() {
                     solidcraft_ui_egui::documents::new_tab(app);
                     return "ok: a new design opened in a new tab; the previous design is still open in its own tab. If the user asked for nothing else, call no more tools and reply in one sentence.".to_string();
@@ -560,6 +569,12 @@ impl State {
 
     /// Send what was said, then listen for the next command.
     fn submit_spoken(&mut self) {
+        if STOP_WORDS.contains(&ai_data::normalise(&self.input).as_str()) {
+            self.input.clear();
+            self.stop_speaking();
+            self.log.push("· Stopped listening".to_string());
+            return;
+        }
         let keep = self.continuous;
         self.submit(false);
         self.continuous = keep;
@@ -579,6 +594,13 @@ impl State {
             }
         }
         let typed = std::mem::take(&mut self.input).trim().to_string();
+        if let Ok(mut a) = APPLE_REQUEST.lock() {
+            *a = None;
+        }
+        if STOP_WORDS.contains(&ai_data::normalise(&typed).as_str()) {
+            self.log.push("· Stopped".to_string());
+            return;
+        }
         self.log.push(format!("You: {typed}"));
         self.busy = true;
         self.last = None;
@@ -603,6 +625,9 @@ impl State {
             return;
         }
         self.current = Some(Current { id, request: typed, tier: "apple", earlier: String::new(), calls: Vec::new() });
+        if let Ok(mut a) = APPLE_REQUEST.lock() {
+            *a = Some(ai_data::normalise(&request));
+        }
         let prompt = self.hints.prompt(&request);
         if let Ok(b) = self.bridge() {
             // Each request starts clean: the design is the memory, and the model's own is small.
