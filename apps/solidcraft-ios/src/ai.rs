@@ -43,6 +43,8 @@ const STOP_WORDS: &[&str] = &["stop", "stop listening", "cancel", "never mind", 
 
 /// The Claude model asked when the on-device model can't (a different one: `claude_model` in the hints file).
 const CLAUDE_MODEL: &str = "claude-haiku-5-5";
+/// The offline model's short name, shown instead of "local" (the model itself is named in LocalLLM.swift).
+const LOCAL_NAME: &str = "Qwen3 4B";
 
 /// The longest tool answer: the model's context is small.
 const MAX_REPLY: usize = 600;
@@ -684,7 +686,7 @@ impl State {
                     return;
                 }
                 Some(_) => {
-                    self.log.push("· A request with several steps, and no internet: asking the local model".to_string());
+                    self.log.push(format!("· A request with several steps, and no internet: asking {LOCAL_NAME}"));
                     self.current = Some(Current { id, request: typed, tier: "local", earlier: String::new(), calls: Vec::new() });
                     self.ask_local(&request);
                     return;
@@ -828,6 +830,7 @@ impl State {
             "kind": "request", "id": cur.id, "t": cur.id / 1000, "request": cur.request, "tier": cur.tier,
             "calls": cur.calls.iter().map(|(c, r)| json!({ "call": c, "reply": r })).collect::<Vec<_>>(),
             "answer": answer, "error": error, "escalated": escalate,
+            "model": match cur.tier { "local" => LOCAL_NAME, "claude" => "Claude", "apple" => "Apple", _ => "" },
         }));
         if escalate {
             let done: Vec<String> = cur
@@ -843,7 +846,7 @@ impl State {
                 self.current = Some(Current { id, request: cur.request.clone(), tier: "claude", earlier: done.join("; "), calls: Vec::new() });
                 self.ask_claude(&request);
             } else {
-                self.log.push("· The on-device model couldn't do that, and there is no internet: asking the local model…".to_string());
+                self.log.push(format!("· The on-device model couldn't do that, and there is no internet: asking {LOCAL_NAME}…"));
                 self.current = Some(Current { id, request: cur.request.clone(), tier: "local", earlier: done.join("; "), calls: Vec::new() });
                 self.ask_local(&request);
             }
@@ -925,7 +928,7 @@ impl State {
                 1 => {
                     self.local_state = "ready".to_string();
                     self.local_progress.clear();
-                    self.log.push("· The local model is ready for offline use".to_string());
+                    self.log.push(format!("· {LOCAL_NAME} is ready for offline use"));
                 }
                 _ => {
                     self.local_state = "none".to_string();
@@ -1028,7 +1031,7 @@ impl State {
                     }
                 });
             }
-            ui.collapsing("Local model (offline)", |ui| {
+            ui.collapsing(format!("{LOCAL_NAME} (offline model)"), |ui| {
                 ui.label("Used when there is no internet. It downloads once (about 2.3 GB, over Wi-Fi) and then works offline.");
                 match self.local_state.as_str() {
                     "ready" => {
@@ -1038,7 +1041,7 @@ impl State {
                         ui.label(format!("Downloading… {}", self.local_progress));
                     }
                     _ => {
-                        if ui.button("Download the local model").clicked() {
+                        if ui.button(format!("Download {LOCAL_NAME}")).clicked() {
                             self.local_state = "loading".to_string();
                             self.local_progress = "0%".to_string();
                             if let Ok(b) = self.bridge() {
@@ -1097,7 +1100,7 @@ impl State {
                 if self.has_key && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new("Ask Claude")).clicked() {
                     self.submit(true);
                 }
-                if self.local_state == "ready" && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new("Ask local")).clicked() {
+                if self.local_state == "ready" && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new(format!("Ask {LOCAL_NAME}"))).clicked() {
                     let typed = self.input.trim().to_string();
                     self.input.clear();
                     self.log.push(format!("You: {typed}"));
