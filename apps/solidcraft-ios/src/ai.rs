@@ -189,7 +189,10 @@ fn round_edges(app: &mut SolveApp, v: &Value) -> String {
     let zs: Vec<f64> = edges.iter().filter_map(|e| pt(e, "mid").map(|m| m[2])).collect();
     let (zmin, zmax) = (zs.iter().cloned().fold(f64::INFINITY, f64::min), zs.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
     let tol = 1e-6 * (1.0 + zmax.abs().max(zmin.abs()));
-    let which = text("which");
+    let which = text("which").trim().to_lowercase();
+    if !matches!(which.as_str(), "" | "all" | "every" | "everything" | "top" | "bottom" | "vertical" | "sides" | "horizontal" | "flat") {
+        return format!("error: which must be all, top, bottom, vertical or horizontal, not \"{which}\"");
+    }
     let picked: Vec<Value> = edges
         .iter()
         .filter(|e| {
@@ -200,6 +203,8 @@ fn round_edges(app: &mut SolveApp, v: &Value) -> String {
                 "top" => flat && (a[2] - zmax).abs() <= tol,
                 "bottom" => flat && (a[2] - zmin).abs() <= tol,
                 "vertical" | "sides" => vertical,
+                // The edges that run level: the top and bottom edges of a box.
+                "horizontal" | "flat" => flat,
                 _ => true,
             }
         })
