@@ -29,6 +29,7 @@ struct App {
     ai: ai::State,
     /// The view is moved left to clear the AI window while it is open.
     ai_shifted: bool,
+    ai_view: Option<(solidcraft_engine::render::Camera, solidcraft_engine::render::Camera)>,
     frames: u32,
     synced_at: f64,
 }
@@ -104,11 +105,23 @@ impl eframe::App for App {
         {
             let lift = (keyboard::covered() - ui.ctx().input(|i| i.safe_area_insets().0.bottom)).max(0.0);
             self.ai.show(ui.ctx(), lift);
-            // The model moves left while the window is up, and back when it closes.
+            // While the window is up the model is framed in the space left of it; closing puts the
+            // view back (unless it was moved meanwhile).
             if self.ai.is_open() != self.ai_shifted {
                 self.ai_shifted = self.ai.is_open();
-                let shift = 210.0 * if self.ai_shifted { -1.0 } else { 1.0 };
-                self.solve.cam.pan(shift, 0.0, f64::from(safe.height()));
+                if self.ai_shifted {
+                    let before = self.solve.cam;
+                    let mut cam = self.solve.fitted(before);
+                    cam.distance *= 1.6;
+                    cam.pan(-90.0, 0.0, f64::from(safe.height()));
+                    self.solve.cam = cam;
+                    self.ai_view = Some((before, cam));
+                } else if let Some((before, after)) = self.ai_view.take() {
+                    let now = self.solve.cam;
+                    if now == after {
+                        self.solve.cam = before;
+                    }
+                }
             }
         }
     }
@@ -203,6 +216,7 @@ fn run() -> eframe::Result {
                 #[cfg(target_os = "ios")]
                 ai: ai::State::default(),
                 ai_shifted: false,
+                ai_view: None,
                 frames: 0,
                 synced_at: 0.0,
             }))
