@@ -29,6 +29,9 @@ const CLAUDE_KEYWORDS: &[&str] = &[
     "join", "drill", "countersink", "slot", "subtract", "union",
 ];
 
+/// Short follow-ups that only make sense with the request before them: Claude gets that request too.
+const FOLLOW_UPS: &[&str] = &["continue", "go on", "carry on", "keep going", "yes", "ok", "okay", "do it", "go ahead", "try again", "finish it"];
+
 /// The most text hints add to a prompt: the on-device model's memory is small.
 const MAX_HINT_CHARS: usize = 900;
 
@@ -204,6 +207,9 @@ impl Hints {
 
     /// Whether the request names something the on-device model cannot do (whole words, any case).
     pub fn wants_claude(&self, request: &str) -> bool {
+        if FOLLOW_UPS.contains(&normalise(request).as_str()) {
+            return true;
+        }
         normalise(request).split(' ').any(|w| {
             let w = w.trim_end_matches('s');
             CLAUDE_KEYWORDS.iter().any(|k| *k == w) || self.claude_keywords.iter().any(|k| k.trim_end_matches('s') == w)
@@ -348,6 +354,7 @@ mod tests {
         assert!(h.wants_claude("make the holes 10 mm and move them 5 mm closer"));
         assert!(h.wants_claude("Cut a slot"));
         assert!(!h.wants_claude("move plate 30mm to the left"));
+        assert!(h.wants_claude("Continue!") && h.wants_claude("go on"));
         assert!(!h.wants_claude("fillet all edges 5 mm"));
         assert!(!h.wants_claude("wholesale changes"));
         h.claude_keywords.push("dovetail".into());

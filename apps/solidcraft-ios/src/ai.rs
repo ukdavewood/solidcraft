@@ -190,9 +190,13 @@ fn round_edges(app: &mut SolveApp, v: &Value) -> String {
     }
 }
 
-fn clip(mut text: String) -> String {
-    if text.len() > MAX_REPLY {
-        let mut end = MAX_REPLY;
+fn clip(text: String) -> String {
+    clip_to(text, MAX_REPLY)
+}
+
+fn clip_to(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -358,9 +362,37 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
         }
         Some("inspect") => {
             let state = app.session.world_state();
-            let bodies: Vec<String> = state.bodies.iter().take(60).map(|b| format!("{}{}", b.name, if app.session.body_visible(&b.name) { "" } else { " (hidden)" })).collect();
-            let params: Vec<String> = app.session.doc.params.iter().take(30).map(|p| format!("{}={}", p.name, if p.unit.is_empty() || p.expr.contains(p.unit.as_str()) { p.expr.clone() } else { format!("{} {}", p.expr, p.unit) })).collect();
-            clip(format!("bodies ({}): {}\nparameters: {}", state.bodies.len(), bodies.join(", "), params.join("; ")))
+            let bodies: Vec<String> = state.bodies.iter().take(40).map(|b| format!("{}{}", b.name, if app.session.body_visible(&b.name) { "" } else { " (hidden)" })).collect();
+            // The timeline: feature names and kinds, so a feature can be inspected or edited by name.
+            let features: Vec<String> = app
+                .run("document.inspect", json!({}))
+                .ok()
+                .and_then(|d| d.get("timeline").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+                .iter()
+                .take(40)
+                .filter_map(|f| Some(format!("{}({})", f.get("name")?.as_str()?, f.get("type")?.as_str()?.trim_end_matches("Feature"))))
+                .collect();
+            // The parameters, and which feature input each one drives.
+            let params: Vec<String> = app
+                .run("parameters.list", json!({}))
+                .ok()
+                .and_then(|p| p.get("parameters").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+                .iter()
+                .take(40)
+                .filter_map(|q| {
+                    let used = match (q.get("feature").and_then(Value::as_str), q.get("input").and_then(Value::as_str)) {
+                        (Some(f), Some(i)) => format!(" [{f}.{i}]"),
+                        _ => String::new(),
+                    };
+                    Some(format!("{}={}{used}", q.get("name")?.as_str()?, q.get("expression")?.as_str()?))
+                })
+                .collect();
+            clip_to(
+                format!("bodies ({}): {}\nfeatures: {}\nparameters: {}", state.bodies.len(), bodies.join(", "), features.join(" "), params.join("; ")),
+                1800,
+            )
         }
         _ => "error: unknown request".to_string(),
     }
@@ -390,6 +422,8 @@ struct Rated {
 #[derive(Default)]
 pub struct State {
     hints: Hints,
+    /// The last request and its answer, told to Claude so a follow-up like "continue" makes sense.
+    last_exchange: Option<(String, String)>,
     current: Option<Current>,
     /// Calls from a learned request or recipe, run on the next frame.
     pending: Option<Vec<Value>>,
@@ -470,6 +504,9 @@ impl State {
     fn ask_claude(&mut self, request: &str) {
         let earlier = self.current.as_ref().map(|c| c.earlier.clone()).unwrap_or_default();
         let mut prompt = self.hints.prompt(request);
+        if let Some((q, a)) = &self.last_exchange {
+            prompt = format!("Previous request: {q}\nPrevious answer: {}\n{prompt}", a.chars().take(400).collect::<String>());
+        }
         if !earlier.is_empty() {
             prompt = format!("{prompt}\nAn earlier attempt by the on-device model already applied: {earlier}");
         }
@@ -550,6 +587,7 @@ impl State {
             return;
         }
         self.busy = false;
+        self.last_exchange = Some((cur.request.clone(), answer.clone()));
         let shown = if answer == "error: offline" { "error: no internet, so Claude could not be asked".to_string() } else { answer };
         self.log.push(format!("AI: {shown}"));
         self.last = Some(Rated { id: cur.id, request: cur.request, tier: cur.tier, calls: cur.calls.into_iter().map(|(c, _)| c).collect(), clean });
