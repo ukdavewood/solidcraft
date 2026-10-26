@@ -32,6 +32,9 @@ static SPOKEN: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 static CALLS: Mutex<Vec<(Value, String)>> = Mutex::new(Vec::new());
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
+/// The Claude model asked when the on-device model can't (a different one: `claude_model` in the hints file).
+const CLAUDE_MODEL: &str = "claude-haiku-5-5";
+
 /// The longest tool answer: the model's context is small.
 const MAX_REPLY: usize = 600;
 
@@ -80,6 +83,11 @@ struct Bridge {
     availability: extern "C" fn() -> *mut c_char,
     listen_start: extern "C" fn(TextFn),
     listen_stop: extern "C" fn(),
+    claude_ask: extern "C" fn(*const c_char, *const c_char, DoneFn),
+    has_key: extern "C" fn() -> i32,
+    set_key: extern "C" fn(*const c_char) -> i32,
+    clear_key: extern "C" fn(),
+    usage: extern "C" fn() -> *mut c_char,
 }
 
 fn load() -> Result<Bridge, String> {
@@ -110,6 +118,11 @@ fn load() -> Result<Bridge, String> {
             availability: std::mem::transmute(sym(c"sc_ai_availability")?),
             listen_start: std::mem::transmute(sym(c"sc_ai_listen_start")?),
             listen_stop: std::mem::transmute(sym(c"sc_ai_listen_stop")?),
+            claude_ask: std::mem::transmute(sym(c"sc_ai_claude_ask")?),
+            has_key: std::mem::transmute(sym(c"sc_ai_has_key")?),
+            set_key: std::mem::transmute(sym(c"sc_ai_set_key")?),
+            clear_key: std::mem::transmute(sym(c"sc_ai_clear_key")?),
+            usage: std::mem::transmute(sym(c"sc_ai_claude_usage")?),
         })
     }
 }
@@ -307,6 +320,8 @@ struct Current {
     id: u64,
     request: String,
     tier: &'static str,
+    /// What the on-device attempt did before Claude was asked (told to Claude).
+    earlier: String,
     calls: Vec<(Value, String)>,
 }
 
@@ -332,6 +347,11 @@ pub struct State {
     log: Vec<String>,
     busy: bool,
     listening: bool,
+    /// The Claude tier: a key is saved; the user turned automatic hand-over off; the key being typed.
+    has_key: bool,
+    claude_off: bool,
+    key_input: String,
+    usage: String,
     bridge: Option<Result<Bridge, String>>,
     availability: String,
 }
@@ -358,7 +378,7 @@ impl State {
     }
 
     /// Send what is typed: replay a learned request or recipe, else ask the on-device model.
-    fn submit(&mut self) {
+    fn submit(&mut self, claude_only: bool) {
         let typed = std::mem::take(&mut self.input).trim().to_string();
         self.log.push(format!("You: {typed}"));
         self.busy = true;
@@ -366,13 +386,18 @@ impl State {
         self.hints.refresh();
         let request = self.hints.rewrite(&typed);
         let id = ai_data::now_millis();
+        if claude_only {
+            self.current = Some(Current { id, request: typed, tier: "claude", earlier: String::new(), calls: Vec::new() });
+            self.ask_claude(&request);
+            return;
+        }
         if let Some((tier, calls)) = self.hints.replay(&request) {
-            self.current = Some(Current { id, request: typed, tier, calls: Vec::new() });
+            self.current = Some(Current { id, request: typed, tier, earlier: String::new(), calls: Vec::new() });
             self.pending = Some(calls);
             repaint();
             return;
         }
-        self.current = Some(Current { id, request: typed, tier: "apple", calls: Vec::new() });
+        self.current = Some(Current { id, request: typed, tier: "apple", earlier: String::new(), calls: Vec::new() });
         let prompt = self.hints.prompt(&request);
         if let Ok(b) = self.bridge() {
             // Each request starts clean: the design is the memory, and the model's own is small.
@@ -383,20 +408,79 @@ impl State {
         }
     }
 
+    /// Ask Claude (the second tier) the request, with what an earlier attempt did, if anything.
+    fn ask_claude(&mut self, request: &str) {
+        let earlier = self.current.as_ref().map(|c| c.earlier.clone()).unwrap_or_default();
+        let mut prompt = self.hints.prompt(request);
+        if !earlier.is_empty() {
+            prompt = format!("{prompt}\nAn earlier attempt by the on-device model already applied: {earlier}");
+        }
+        let model = self.hints.claude_model.clone().unwrap_or_else(|| CLAUDE_MODEL.to_string());
+        if let Ok(b) = self.bridge() {
+            if let (Ok(p), Ok(m)) = (CString::new(prompt.replace('\0', " ")), CString::new(model.replace('\0', " "))) {
+                (b.claude_ask)(p.as_ptr(), m.as_ptr(), done_cb);
+            }
+        }
+    }
+
+    /// Whether a Claude key is saved, and the usage so far.
+    fn refresh_key(&mut self) {
+        let (has, usage) = match self.bridge() {
+            Ok(b) => {
+                let has = (b.has_key)() == 1;
+                let p = (b.usage)();
+                let text = if p.is_null() {
+                    String::new()
+                } else {
+                    // SAFETY: the framework returns a `strdup`ed C string.
+                    let t = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+                    unsafe { libc::free(p.cast()) };
+                    t
+                };
+                (has, text)
+            }
+            Err(_) => (false, String::new()),
+        };
+        self.has_key = has;
+        self.usage = serde_json::from_str::<Value>(&usage)
+            .map(|u| format!("Claude so far: {} requests, {} tokens in, {} out", u["requests"], u["input"], u["output"]))
+            .unwrap_or_default();
+    }
+
     /// Write the finished request to the log and offer to rate it.
     fn finish(&mut self, answer: String) {
-        self.busy = false;
-        self.log.push(format!("AI: {answer}"));
-        let Some(cur) = self.current.take() else { return };
+        let Some(cur) = self.current.take() else {
+            self.busy = false;
+            self.log.push(format!("AI: {answer}"));
+            return;
+        };
         let error = answer.starts_with("error");
-        ai_data::log(&json!({
-            "kind": "request", "id": cur.id, "t": cur.id / 1000, "request": cur.request, "tier": cur.tier,
-            "calls": cur.calls.iter().map(|(c, r)| json!({ "call": c, "reply": r })).collect::<Vec<_>>(),
-            "answer": answer, "error": error,
-        }));
         let clean = !error
             && !cur.calls.is_empty()
             && cur.calls.iter().all(|(_, r)| !(r.starts_with("error") || r.starts_with("refused") || r.starts_with("no ")));
+        // The on-device model could not do it: hand over to Claude, telling it what was already done.
+        let escalate = cur.tier == "apple" && !clean && self.has_key && !self.claude_off;
+        ai_data::log(&json!({
+            "kind": "request", "id": cur.id, "t": cur.id / 1000, "request": cur.request, "tier": cur.tier,
+            "calls": cur.calls.iter().map(|(c, r)| json!({ "call": c, "reply": r })).collect::<Vec<_>>(),
+            "answer": answer, "error": error, "escalated": escalate,
+        }));
+        if escalate {
+            let done: Vec<String> = cur
+                .calls
+                .iter()
+                .filter(|(c, r)| r.starts_with("ok") && c.get("tool").and_then(Value::as_str).is_some_and(|t| t != "find" && t != "inspect"))
+                .filter_map(|(c, r)| Some(format!("{} -> {r}", ai_data::describe_call(c)?)))
+                .collect();
+            self.log.push("· The on-device model couldn't do that: asking Claude…".to_string());
+            let id = ai_data::now_millis();
+            self.current = Some(Current { id, request: cur.request.clone(), tier: "claude", earlier: done.join("; "), calls: Vec::new() });
+            self.ask_claude(&self.hints.rewrite(&cur.request));
+            return;
+        }
+        self.busy = false;
+        let shown = if answer == "error: offline" { "error: no internet, so Claude could not be asked".to_string() } else { answer };
+        self.log.push(format!("AI: {shown}"));
         self.last = Some(Rated { id: cur.id, request: cur.request, tier: cur.tier, calls: cur.calls.into_iter().map(|(c, _)| c).collect(), clean });
     }
 
@@ -405,8 +489,10 @@ impl State {
         let Some(r) = self.last.take() else { return };
         ai_data::log(&json!({ "kind": "feedback", "id": r.id, "t": ai_data::now_millis() / 1000, "value": if good { "good" } else { "bad" } }));
         if good {
-            if r.tier == "apple" && r.clean {
-                self.hints.learn(&r.request, &r.calls);
+            if (r.tier == "apple" || r.tier == "claude") && r.clean {
+                // Only the calls that changed something: looking things up is not part of a recipe.
+                let changing: Vec<Value> = r.calls.iter().filter(|c| !matches!(c.get("tool").and_then(Value::as_str), Some("find" | "inspect"))).cloned().collect();
+                self.hints.learn(&r.request, &changing);
                 self.log.push("· Good: remembered, the same request now runs at once".to_string());
             } else {
                 self.log.push("· Good".to_string());
@@ -471,6 +557,7 @@ impl State {
                 self.open = !self.open;
                 // Makes the Documents/ai folder (log, learned requests, hints) show in Files.
                 self.hints.refresh();
+                self.refresh_key();
             }
         });
         if !self.open {
@@ -502,6 +589,30 @@ impl State {
                     }
                 });
             }
+            ui.collapsing("Claude (second tier)", |ui| {
+                if self.has_key {
+                    ui.label("Key saved in the Keychain. Claude is asked only when the on-device model can't do a request, or with Ask Claude.");
+                    ui.checkbox(&mut self.claude_off, "Do not ask Claude automatically");
+                    ui.label(egui::RichText::new(self.usage.clone()).weak());
+                    if ui.button("Remove key").clicked() {
+                        if let Ok(b) = self.bridge() {
+                            (b.clear_key)();
+                        }
+                        self.refresh_key();
+                    }
+                } else {
+                    ui.label("Paste an Anthropic API key to let Claude help with requests the on-device model can't do. Requests then leave the device when that happens.");
+                    ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).desired_width(f32::INFINITY).hint_text("sk-ant-…"));
+                    if ui.add_enabled(!self.key_input.trim().is_empty(), egui::Button::new("Save key")).clicked() {
+                        let key = std::mem::take(&mut self.key_input);
+                        if let (Ok(b), Ok(c)) = (self.bridge(), CString::new(key.trim())) {
+                            let saved = (b.set_key)(c.as_ptr()) == 1;
+                            self.log.push(if saved { "· Claude key saved".to_string() } else { "· The key could not be saved".to_string() });
+                        }
+                        self.refresh_key();
+                    }
+                }
+            });
             ui.separator();
             // Enter asks; Shift+Enter is a new line.
             let id = egui::Id::new("ai_input");
@@ -510,7 +621,10 @@ impl State {
             ui.horizontal(|ui| {
                 let ready = !self.busy && !self.input.trim().is_empty() && self.availability == "available";
                 if (ui.add_enabled(ready, egui::Button::new("Ask")).clicked() || (enter && ready)) && ready {
-                    self.submit();
+                    self.submit(false);
+                }
+                if self.has_key && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new("Ask Claude")).clicked() {
+                    self.submit(true);
                 }
                 let speak = if self.listening { "Stop" } else { "Speak" };
                 if ui.button(speak).clicked() {

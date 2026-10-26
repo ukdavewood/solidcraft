@@ -108,6 +108,8 @@ pub struct Hints {
     recipes: Vec<Recipe>,
     /// Requests rated Good: (normalised request, original words, calls).
     learned: Vec<(String, String, Vec<Value>)>,
+    /// The Claude model to ask (`claude_model` in the hints file), else the built-in one.
+    pub claude_model: Option<String>,
     hints_stamp: Option<SystemTime>,
     learned_stamp: Option<SystemTime>,
 }
@@ -139,6 +141,7 @@ impl Hints {
                 .filter_map(|e| Some((e.get(k1)?.as_str()?.to_string(), e.get(k2)?.as_str()?.to_string())))
                 .collect()
         };
+        self.claude_model = v.get("claude_model").and_then(Value::as_str).map(str::to_string);
         self.rewrites = strings(v.get("rewrites").unwrap_or(&Value::Null), "from", "to").into_iter().map(|(a, b)| (a.to_lowercase(), b)).collect();
         self.instructions = v.get("instructions").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string)).collect();
         self.examples = strings(v.get("examples").unwrap_or(&Value::Null), "request", "call");
