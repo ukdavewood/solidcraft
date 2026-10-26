@@ -317,6 +317,30 @@ fn change_view(app: &mut SolveApp, v: &Value) -> String {
     format!("ok: view {action}")
 }
 
+/// What the user has selected, with a point on each face or edge to pass to commands (`faces: [[x,y,z]]`).
+fn describe_selection(app: &SolveApp) -> String {
+    use solidcraft_engine::Sel;
+    let p = |v: &solidcraft_engine::geom::Vec3| format!("[{:.2}, {:.2}, {:.2}]", v.x, v.y, v.z);
+    let items: Vec<String> = app
+        .session
+        .selection
+        .iter()
+        .take(20)
+        .map(|s| match s {
+            Sel::Body { name } => format!("body {name}"),
+            Sel::Face { body, point, .. } => format!("face of {body} at {}", p(point)),
+            Sel::Edge { body, point, .. } => format!("edge of {body} at {}", p(point)),
+            Sel::Feature { id } => format!("feature {id}"),
+            _ => "something else".to_string(),
+        })
+        .collect();
+    if items.is_empty() {
+        "nothing is selected".to_string()
+    } else {
+        format!("selected: {}. For a face use faces: [[x,y,z]] with that point (and body: its body); for a body use bodies: [name].", items.join("; "))
+    }
+}
+
 fn answer(app: &mut SolveApp, request: &str) -> String {
     let v: Value = serde_json::from_str(request).unwrap_or(Value::Null);
     match v.get("tool").and_then(Value::as_str) {
@@ -395,6 +419,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             }
         }
         Some("view") => change_view(app, &v),
+        Some("selection") => describe_selection(app),
         Some("escalate") => "no tool can do this request: it needs a more capable assistant. Call no more tools and reply \"Handing over.\"".to_string(),
         Some("round") => round_edges(app, &v),
         Some("move") => {
@@ -523,8 +548,9 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
                     Some(format!("{}={}{used}", q.get("name")?.as_str()?, q.get("expression")?.as_str()?))
                 })
                 .collect();
+            let selected = if app.session.selection.is_empty() { String::new() } else { format!("\n{}", describe_selection(app)) };
             clip_to(
-                format!("bodies ({}): {}\nfeatures: {}\nparameters: {}", state.bodies.len(), bodies.join(", "), features.join(" "), params.join("; ")),
+                format!("bodies ({}): {}{selected}\nfeatures: {}\nparameters: {}", state.bodies.len(), bodies.join(", "), features.join(" "), params.join("; ")),
                 1800,
             )
         }
@@ -553,8 +579,61 @@ struct Rated {
     clean: bool,
 }
 
+/// One line of a demo script.
+enum ScriptItem {
+    /// Type this into the box and send it: `route` is "" (the usual order), "claude" or "local".
+    Say { text: String, route: &'static str },
+    /// Wait this many milliseconds.
+    Pause(u64),
+    /// A named marker written to the log, to find a take afterwards.
+    Take(String),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScriptPhase {
+    Typing,
+    Pausing,
+    Waiting,
+    Gap,
+}
+
+/// A script being played: the prompts are typed in and sent one after another.
+struct ScriptRun {
+    items: Vec<ScriptItem>,
+    index: usize,
+    typed: usize,
+    phase: ScriptPhase,
+    until: u64,
+}
+
+/// `Documents/ai/ai-script.txt`: one prompt per line; `#` comments; `[claude]` or `[local]` before a prompt
+/// picks the model; `@pause 3` waits 3 seconds; `@take Name` writes a marker to the log.
+fn parse_script(text: &str) -> Vec<ScriptItem> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            if let Some(rest) = l.strip_prefix("@pause") {
+                ScriptItem::Pause((rest.trim().parse::<f64>().unwrap_or(1.0).clamp(0.0, 60.0) * 1000.0) as u64)
+            } else if let Some(rest) = l.strip_prefix("@take") {
+                ScriptItem::Take(rest.trim().to_string())
+            } else if let Some(rest) = l.strip_prefix("[claude]") {
+                ScriptItem::Say { text: rest.trim().to_string(), route: "claude" }
+            } else if let Some(rest) = l.strip_prefix("[local]") {
+                ScriptItem::Say { text: rest.trim().to_string(), route: "local" }
+            } else {
+                ScriptItem::Say { text: l.to_string(), route: "" }
+            }
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub struct State {
+    script: Option<ScriptRun>,
+    script_poll: u64,
+    /// The on-device model's steps to undo, then the request to hand over: (steps, request, "claude" or "local").
+    after_undo: Option<(usize, String, &'static str)>,
     hints: Hints,
     /// The last request and its answer, told to Claude so a follow-up like "continue" makes sense.
     last_exchange: Option<(String, String)>,
@@ -713,6 +792,128 @@ impl State {
         }
     }
 
+    /// Whether a finished call changed the design in a way `edit.undo` takes back.
+fn undoable(call: &Value, reply: &str) -> bool {
+    if !reply.starts_with("ok") {
+        return false;
+    }
+    match call.get("tool").and_then(Value::as_str) {
+        Some("shape" | "round" | "move") => true,
+        Some("run") => call.get("command").and_then(Value::as_str).is_some_and(|c| ["solid.", "sketch.", "parameters.", "body.", "appearance.", "timeline."].iter().any(|p| c.starts_with(p))),
+        _ => false,
+    }
+}
+
+/// Start playing `Documents/ai/ai-script.txt`.
+    fn start_script(&mut self) {
+        let text = std::fs::read_to_string(ai_data::dir().join("ai-script.txt")).unwrap_or_default();
+        let items = parse_script(&text);
+        if items.is_empty() {
+            self.log.push("· No script: put prompts, one per line, in Files > SolidCraft > ai > ai-script.txt".to_string());
+            return;
+        }
+        self.stop_speaking();
+        self.open = true;
+        self.input.clear();
+        ai_data::log(&json!({ "kind": "script", "event": "start", "t": ai_data::now_millis() / 1000 }));
+        self.log.push(format!("· Playing the script ({} lines)", items.len()));
+        let mut run = ScriptRun { items, index: 0, typed: 0, phase: ScriptPhase::Gap, until: ai_data::now_millis() + 800 };
+        Self::script_skip(&mut run);
+        self.script = Some(run);
+    }
+
+    /// Past the pauses and markers at the current position, up to the next prompt.
+    fn script_skip(run: &mut ScriptRun) {
+        while let Some(item) = run.items.get(run.index) {
+            match item {
+                ScriptItem::Pause(ms) => run.until = run.until.max(ai_data::now_millis()) + ms,
+                ScriptItem::Take(name) => ai_data::log(&json!({ "kind": "take", "name": name, "t": ai_data::now_millis() / 1000, "id": ai_data::now_millis() })),
+                ScriptItem::Say { .. } => break,
+            }
+            run.index += 1;
+        }
+        run.typed = 0;
+        run.phase = ScriptPhase::Typing;
+    }
+
+    /// One step of the script: a character, a pause, or sending the prompt (called every frame).
+    fn script_step(&mut self) {
+        let now = ai_data::now_millis();
+        // A file `ai-script.run` starts the script (so it can be started from outside the app).
+        if self.script.is_none() && now.saturating_sub(self.script_poll) > 2000 {
+            self.script_poll = now;
+            let flag = ai_data::dir().join("ai-script.run");
+            if flag.exists() {
+                let _ = std::fs::remove_file(flag);
+                self.start_script();
+            }
+        }
+        let Some(mut run) = self.script.take() else { return };
+        if now < run.until {
+            self.script = Some(run);
+            return;
+        }
+        let Some(ScriptItem::Say { text, route }) = run.items.get(run.index) else {
+            ai_data::log(&json!({ "kind": "script", "event": "end", "t": now / 1000 }));
+            self.log.push("· The script has finished".to_string());
+            return;
+        };
+        let (text, route) = (text.clone(), *route);
+        match run.phase {
+            ScriptPhase::Typing => {
+                if run.typed == 0 {
+                    self.input.clear();
+                }
+                match text.chars().nth(run.typed) {
+                    Some(c) => {
+                        self.input.push(c);
+                        run.typed += 1;
+                        run.until = now + 35;
+                    }
+                    None => {
+                        run.phase = ScriptPhase::Pausing;
+                        run.until = now + 700;
+                    }
+                }
+            }
+            ScriptPhase::Pausing => {
+                match route {
+                    "claude" if self.has_key => self.submit(true),
+                    "local" if self.local_state == "ready" => self.submit_local(),
+                    _ => self.submit(false),
+                }
+                run.phase = ScriptPhase::Waiting;
+                run.until = now + 400;
+            }
+            ScriptPhase::Waiting => {
+                if self.busy || self.pending.is_some() || self.after_undo.is_some() {
+                    run.until = now + 200;
+                } else {
+                    run.phase = ScriptPhase::Gap;
+                    run.until = now + 2500;
+                }
+            }
+            ScriptPhase::Gap => {
+                run.index += 1;
+                Self::script_skip(&mut run);
+            }
+        }
+        self.script = Some(run);
+        repaint();
+    }
+
+    /// Send what is typed to the offline model.
+    fn submit_local(&mut self) {
+        let typed = self.input.trim().to_string();
+        self.input.clear();
+        self.log.push(format!("You: {typed}"));
+        self.busy = true;
+        self.last = None;
+        let id = ai_data::now_millis();
+        self.current = Some(Current { id, request: typed.clone(), tier: "local", earlier: String::new(), calls: Vec::new() });
+        self.ask_local(&self.hints.rewrite(&typed));
+    }
+
     /// Whether the iPad has a network path.
     fn online(&mut self) -> bool {
         self.bridge().map(|b| (b.online)() == 1).unwrap_or(true)
@@ -838,23 +1039,22 @@ impl State {
             "model": match cur.tier { "local" => LOCAL_NAME, "claude" => "Claude", "apple" => "Apple", _ => "" },
         }));
         if escalate {
-            let done: Vec<String> = cur
-                .calls
-                .iter()
-                .filter(|(c, r)| r.starts_with("ok") && c.get("tool").and_then(Value::as_str).is_some_and(|t| t != "find" && t != "inspect"))
-                .filter_map(|(c, r)| Some(format!("{} -> {r}", ai_data::describe_call(c)?)))
-                .collect();
             let id = ai_data::now_millis();
             let request = self.hints.rewrite(&cur.request);
-            if second == Some("claude") {
+            // Everything the on-device model changed is undone first, so the next model starts clean.
+            let steps = cur.calls.iter().filter(|(c, r)| Self::undoable(c, r)).count();
+            let tier = if second == Some("claude") { "claude" } else { "local" };
+            if tier == "claude" {
                 self.log.push("· The on-device model couldn't do that: asking Claude…".to_string());
-                self.current = Some(Current { id, request: cur.request.clone(), tier: "claude", earlier: done.join("; "), calls: Vec::new() });
-                self.ask_claude(&request);
             } else {
                 self.log.push(format!("· The on-device model couldn't do that, and there is no internet: asking {LOCAL_NAME}…"));
-                self.current = Some(Current { id, request: cur.request.clone(), tier: "local", earlier: done.join("; "), calls: Vec::new() });
-                self.ask_local(&request);
             }
+            if steps > 0 {
+                self.log.push(format!("· Undoing the on-device model's {steps} step{}", if steps == 1 { "" } else { "s" }));
+            }
+            self.current = Some(Current { id, request: cur.request.clone(), tier, earlier: String::new(), calls: Vec::new() });
+            self.after_undo = Some((steps, request, tier));
+            repaint();
             return;
         }
         self.busy = false;
@@ -891,6 +1091,17 @@ impl State {
 
     /// Answer the model's requests and take in its answers (the UI thread, once a frame).
     pub fn tick(&mut self, app: &mut SolveApp) {
+        // A hand-over starts from the design as it was before the on-device model touched it.
+        if let Some((steps, request, tier)) = self.after_undo.take() {
+            for _ in 0..steps {
+                let _ = app.run("edit.undo", json!({}));
+            }
+            if tier == "claude" {
+                self.ask_claude(&request);
+            } else {
+                self.ask_local(&request);
+            }
+        }
         let requests: Vec<_> = REQUESTS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
         for (text, tx) in requests {
             let reply = handle(app, &text);
@@ -976,6 +1187,9 @@ impl State {
     /// `lift`: how far a docked keyboard reaches up from the bottom of the screen (0: none).
     pub fn show(&mut self, ctx: &egui::Context, lift: f32) {
         let _ = CTX.set(ctx.clone());
+        self.script_step();
+        // While a script plays the screen refreshes often; otherwise now and then, to notice ai-script.run.
+        ctx.request_repaint_after(std::time::Duration::from_millis(if self.script.is_some() { 40 } else { 2000 }));
         if self.listening {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             // A pause after some words sends the request.
@@ -1036,6 +1250,18 @@ impl State {
                     }
                 });
             }
+            ui.collapsing("Demo script", |ui| {
+                ui.label("Plays the prompts in Files > SolidCraft > ai > ai-script.txt: each is typed in and sent, one after another.");
+                if let Some(run) = &self.script {
+                    ui.label(format!("Playing: line {} of {}", run.index + 1, run.items.len()));
+                    if ui.button("Stop script").clicked() {
+                        self.script = None;
+                        ai_data::log(&json!({ "kind": "script", "event": "stopped", "t": ai_data::now_millis() / 1000 }));
+                    }
+                } else if ui.add_enabled(!self.busy, egui::Button::new("Run script")).clicked() {
+                    self.start_script();
+                }
+            });
             ui.collapsing(format!("{LOCAL_NAME} (offline model)"), |ui| {
                 ui.label("Used when there is no internet. It downloads once (about 2.3 GB, over Wi-Fi) and then works offline.");
                 match self.local_state.as_str() {
@@ -1106,14 +1332,7 @@ impl State {
                     self.submit(true);
                 }
                 if self.local_state == "ready" && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new(format!("Ask {LOCAL_NAME}"))).clicked() {
-                    let typed = self.input.trim().to_string();
-                    self.input.clear();
-                    self.log.push(format!("You: {typed}"));
-                    self.busy = true;
-                    self.last = None;
-                    let id = ai_data::now_millis();
-                    self.current = Some(Current { id, request: typed.clone(), tier: "local", earlier: String::new(), calls: Vec::new() });
-                    self.ask_local(&self.hints.rewrite(&typed));
+                    self.submit_local();
                 }
                 if ui.button("Paste").clicked() {
                     self.stop_speaking();
