@@ -27,6 +27,8 @@ struct App {
     files: files::Files,
     #[cfg(target_os = "ios")]
     ai: ai::State,
+    /// The view is moved left to clear the AI window while it is open.
+    ai_shifted: bool,
     frames: u32,
     synced_at: f64,
 }
@@ -102,6 +104,12 @@ impl eframe::App for App {
         {
             let lift = (keyboard::covered() - ui.ctx().input(|i| i.safe_area_insets().0.bottom)).max(0.0);
             self.ai.show(ui.ctx(), lift);
+            // The model moves left while the window is up, and back when it closes.
+            if self.ai.is_open() != self.ai_shifted {
+                self.ai_shifted = self.ai.is_open();
+                let shift = 210.0 * if self.ai_shifted { -1.0 } else { 1.0 };
+                self.solve.cam.pan(shift, 0.0, f64::from(safe.height()));
+            }
         }
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -194,6 +202,7 @@ fn run() -> eframe::Result {
                 files,
                 #[cfg(target_os = "ios")]
                 ai: ai::State::default(),
+                ai_shifted: false,
                 frames: 0,
                 synced_at: 0.0,
             }))

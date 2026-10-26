@@ -298,7 +298,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             if command == "file.new" {
                 if app.session.is_dirty() || !app.session.world_state().bodies.is_empty() {
                     solidcraft_ui_egui::documents::new_tab(app);
-                    return "ok: a new design opened in a new tab; the previous design is still open in its own tab".to_string();
+                    return "ok: a new design opened in a new tab; the previous design is still open in its own tab. If the user asked for nothing else, call no more tools and reply in one sentence.".to_string();
                 }
                 return "ok: the design on screen is already empty".to_string();
             }
@@ -707,6 +707,11 @@ impl State {
         for a in answers {
             self.finish(a);
         }
+    }
+
+    /// Whether the window is showing.
+    pub fn is_open(&self) -> bool {
+        self.open
     }
 
     /// `lift`: how far a docked keyboard reaches up from the bottom of the screen (0: none).
