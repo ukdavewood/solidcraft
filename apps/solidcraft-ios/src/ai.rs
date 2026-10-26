@@ -282,6 +282,23 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             }
         }
         Some("round") => round_edges(app, &v),
+        Some("move") => {
+            let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(0.0);
+            let named = v.get("body").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+            let state = app.session.world_state();
+            let body = state
+                .bodies
+                .iter()
+                .find(|x| !named.is_empty() && x.name.to_lowercase() == named)
+                .or_else(|| state.bodies.iter().rev().find(|x| app.session.body_visible(&x.name)))
+                .or(state.bodies.last())
+                .map(|x| x.name.clone());
+            let Some(body) = body else { return "error: no body to move".to_string() };
+            match app.run("solid.move", json!({ "bodies": [body], "translate": [n("x"), n("y"), n("z")] })) {
+                Ok(_) => format!("ok: moved {body} by [{}, {}, {}] mm", n("x"), n("y"), n("z")),
+                Err(e) => clip(format!("error: {e}")),
+            }
+        }
         Some("shape") => {
             let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite() && *x > 0.0);
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("").to_lowercase();

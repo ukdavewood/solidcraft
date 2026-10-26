@@ -91,6 +91,7 @@ pub fn describe_call(call: &Value) -> Option<String> {
             "sphere" => Some(format!("add_sphere(radius={})", num("a"))),
             _ => None,
         },
+        "move" => Some(format!("move_body(body=\"\", x={}, y={}, z={})", num("x"), num("y"), num("z"))),
         "inspect" => Some("inspect_design()".to_string()),
         "run" => match text("command") {
             "view.show_hide" => Some(format!("show_hide(rule=\"{}\")", call.get("params").and_then(|p| p.get("rule")).and_then(Value::as_str)?)),
