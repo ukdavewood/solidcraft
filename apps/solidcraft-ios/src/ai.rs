@@ -470,7 +470,26 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
         }
         Some("inspect") => {
             let state = app.session.world_state();
-            let bodies: Vec<String> = state.bodies.iter().take(40).map(|b| format!("{}{}", b.name, if app.session.body_visible(&b.name) { "" } else { " (hidden)" })).collect();
+            // Each body's extent, so a request like "beside the plate" can be worked out.
+            let extents: std::collections::HashMap<String, String> = app
+                .run("component.properties", json!({}))
+                .ok()
+                .and_then(|p| p.get("bodies").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|b| {
+                    let name = b.get("name")?.as_str()?.to_string();
+                    let (lo, hi) = (b.pointer("/bbox/min")?.as_array()?, b.pointer("/bbox/max")?.as_array()?);
+                    let axis = |i: usize, n: &str| Some(format!("{n} {:.1}..{:.1}", lo.get(i)?.as_f64()?, hi.get(i)?.as_f64()?));
+                    Some((name, format!(" [{}, {}, {}]", axis(0, "x")?, axis(1, "y")?, axis(2, "z")?)))
+                })
+                .collect();
+            let bodies: Vec<String> = state
+                .bodies
+                .iter()
+                .take(40)
+                .map(|b| format!("{}{}{}", b.name, extents.get(&b.name).map(String::as_str).unwrap_or(""), if app.session.body_visible(&b.name) { "" } else { " (hidden)" }))
+                .collect();
             // The timeline: feature names and kinds, so a feature can be inspected or edited by name.
             let features: Vec<String> = app
                 .run("document.inspect", json!({}))
