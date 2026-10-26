@@ -594,8 +594,13 @@ impl State {
         }
         let replayed = self.pending.take();
         if let Some(calls) = &replayed {
+            // A saved request stops at the first call that fails or is refused: the rest would
+            // build on a design that is not what it was recorded on.
             for call in calls {
-                handle(app, &call.to_string());
+                let reply = handle(app, &call.to_string());
+                if reply.starts_with("error") || reply.starts_with("refused") {
+                    break;
+                }
             }
         }
         if let Some(cur) = self.current.as_mut() {
