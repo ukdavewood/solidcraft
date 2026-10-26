@@ -408,6 +408,11 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             }
         }
         Some("shape") => {
+            // The on-device model adds a cube for "move the cube": shapes only come from add/create/make.
+            let asked = APPLE_REQUEST.lock().ok().and_then(|a| a.clone());
+            if asked.is_some_and(|r| !r.split(' ').any(|w| matches!(w, "add" | "create" | "make" | "build" | "new" | "draw" | "insert" | "place" | "put" | "another"))) {
+                return "refused: the user did not ask to add a shape. To move, round or change something, use the tool for that on the existing body (inspect_design lists the bodies). Do not call again.".to_string();
+            }
             let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite() && *x > 0.0);
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("").to_lowercase();
             let (cmd, params) = match kind.as_str() {
@@ -1063,7 +1068,7 @@ impl State {
             if edit.changed() {
                 self.stop_speaking();
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let ready = !self.busy && !self.input.trim().is_empty() && self.availability == "available";
                 if (ui.add_enabled(ready, egui::Button::new("Ask")).clicked() || (enter && ready)) && ready {
                     self.submit(false);
