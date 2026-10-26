@@ -285,7 +285,9 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("").to_lowercase();
             let (cmd, params) = match kind.as_str() {
                 k if ["box", "cube", "block", "cuboid"].contains(&k) => {
-                    let (l, w, h) = (n("a"), n("b").or(n("a")), n("c").or(n("a")));
+                    // A cube has one size; a box with only one size is a cube too.
+                    let cube = k == "cube";
+                    let (l, w, h) = (n("a"), if cube { n("a") } else { n("b").or(n("a")) }, if cube { n("a") } else { n("c").or(n("a")) });
                     let (Some(l), Some(w), Some(h)) = (l, w, h) else { return "error: a box needs a size in millimetres".to_string() };
                     ("solid.box", json!({ "length": l, "width": w, "height": h }))
                 }

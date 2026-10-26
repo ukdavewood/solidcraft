@@ -84,7 +84,13 @@ pub fn describe_call(call: &Value) -> Option<String> {
     let num = |k: &str| call.get(k).and_then(Value::as_f64).map(|n| format!("{n}")).unwrap_or_default();
     match text("tool") {
         "round" => Some(format!("{}_edges(size={}, which={}, body=\"\")", if text("kind") == "chamfer" { "chamfer" } else { "fillet" }, num("size"), text("which"))),
-        "shape" => Some(format!("add_shape(kind={}, size1={}, size2={}, size3={})", text("kind"), num("a"), num("b"), num("c"))),
+        "shape" => match text("kind") {
+            "cube" => Some(format!("add_cube(size={})", num("a"))),
+            "box" => Some(format!("add_box(length={}, width={}, height={})", num("a"), num("b"), num("c"))),
+            "cylinder" => Some(format!("add_cylinder(radius={}, height={})", num("a"), num("b"))),
+            "sphere" => Some(format!("add_sphere(radius={})", num("a"))),
+            _ => None,
+        },
         "inspect" => Some("inspect_design()".to_string()),
         "run" => match text("command") {
             "view.show_hide" => Some(format!("show_hide(rule=\"{}\")", call.get("params").and_then(|p| p.get("rule")).and_then(Value::as_str)?)),
