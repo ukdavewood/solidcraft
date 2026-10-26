@@ -32,6 +32,8 @@ static SPOKEN: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 static CALLS: Mutex<Vec<(Value, String)>> = Mutex::new(Vec::new());
 /// What the on-device model was asked (normalised), while it is working: it may not start a new design the user did not ask for.
 static APPLE_REQUEST: Mutex<Option<String>> = Mutex::new(None);
+/// Every call of the request being answered, for the loop guard (CALLS is emptied into the log each frame).
+static GUARD: Mutex<Vec<(Value, String)>> = Mutex::new(Vec::new());
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 /// Words that end speaking (or cancel a request) instead of being sent as one.
@@ -214,6 +216,9 @@ fn clip_to(mut text: String, max: usize) -> String {
 /// Answer one tool request from the model.
 fn handle(app: &mut SolveApp, request: &str) -> String {
     let reply = loop_guard(request).unwrap_or_else(|| answer(app, request));
+    if let (Ok(mut g), Ok(call)) = (GUARD.lock(), serde_json::from_str::<Value>(request)) {
+        g.push((call, reply.clone()));
+    }
     if let (Ok(mut calls), Ok(call)) = (CALLS.lock(), serde_json::from_str::<Value>(request)) {
         calls.push((call, reply.clone()));
     }
@@ -227,7 +232,7 @@ fn handle(app: &mut SolveApp, request: &str) -> String {
 /// failed once already, or after too many calls, nothing more runs and the model is told to finish.
 fn loop_guard(request: &str) -> Option<String> {
     const STOP: &str = "STOP: do not call any more tools. Reply with one short sentence.";
-    let calls = CALLS.lock().ok()?;
+    let calls = GUARD.lock().ok()?;
     let tool = |c: &Value| c.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
     let this: Value = serde_json::from_str(request).ok()?;
     if calls.iter().any(|(c, _)| tool(c) == "escalate") && tool(&this) != "escalate" {
@@ -362,7 +367,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
             }
         }
         Some("view") => change_view(app, &v),
-        Some("escalate") => "no tool can do this request: it needs a more capable assistant".to_string(),
+        Some("escalate") => "no tool can do this request: it needs a more capable assistant. Call no more tools and reply \"Handing over.\"".to_string(),
         Some("round") => round_edges(app, &v),
         Some("move") => {
             let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(0.0);
@@ -598,6 +603,9 @@ impl State {
         if let Ok(mut a) = APPLE_REQUEST.lock() {
             *a = None;
         }
+        if let Ok(mut g) = GUARD.lock() {
+            g.clear();
+        }
         if STOP_WORDS.contains(&ai_data::normalise(&typed).as_str()) {
             self.log.push("· Stopped".to_string());
             return;
@@ -641,6 +649,13 @@ impl State {
 
     /// Ask Claude (the second tier) the request, with what an earlier attempt did, if anything.
     fn ask_claude(&mut self, request: &str) {
+        // Claude starts with a clean slate: the on-device model's hand-over is not a reason to stop it.
+        if let Ok(mut g) = GUARD.lock() {
+            g.clear();
+        }
+        if let Ok(mut a) = APPLE_REQUEST.lock() {
+            *a = None;
+        }
         let earlier = self.current.as_ref().map(|c| c.earlier.clone()).unwrap_or_default();
         let mut prompt = self.hints.prompt(request);
         if let Some((q, a)) = &self.last_exchange {
