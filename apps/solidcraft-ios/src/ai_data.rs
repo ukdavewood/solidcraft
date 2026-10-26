@@ -22,6 +22,13 @@ use serde_json::{Value, json};
 const MAX_LOG_BYTES: u64 = 2_000_000;
 /// The most learned requests kept.
 const MAX_LEARNED: usize = 200;
+/// Words that send a request straight to Claude: the on-device model cannot do these (more can be
+/// added as `claude_keywords` in the hints file).
+const CLAUDE_KEYWORDS: &[&str] = &[
+    "hole", "bore", "boss", "pattern", "mirror", "extrude", "sketch", "combine", "thread", "shell", "loft", "revolve", "rib", "bracket", "cut",
+    "join", "drill", "countersink", "slot", "subtract", "union",
+];
+
 /// The most text hints add to a prompt: the on-device model's memory is small.
 const MAX_HINT_CHARS: usize = 900;
 
@@ -117,6 +124,7 @@ pub struct Hints {
     learned: Vec<(String, String, Vec<Value>)>,
     /// The Claude model to ask (`claude_model` in the hints file), else the built-in one.
     pub claude_model: Option<String>,
+    claude_keywords: Vec<String>,
     hints_stamp: Option<SystemTime>,
     learned_stamp: Option<SystemTime>,
 }
@@ -149,6 +157,7 @@ impl Hints {
                 .collect()
         };
         self.claude_model = v.get("claude_model").and_then(Value::as_str).map(str::to_string);
+        self.claude_keywords = v.get("claude_keywords").and_then(Value::as_array).into_iter().flatten().filter_map(|k| k.as_str().map(|k| k.to_lowercase())).collect();
         self.rewrites = strings(v.get("rewrites").unwrap_or(&Value::Null), "from", "to").into_iter().map(|(a, b)| (a.to_lowercase(), b)).collect();
         self.instructions = v.get("instructions").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string)).collect();
         self.examples = strings(v.get("examples").unwrap_or(&Value::Null), "request", "call");
@@ -191,6 +200,14 @@ impl Hints {
             }
         }
         out
+    }
+
+    /// Whether the request names something the on-device model cannot do (whole words, any case).
+    pub fn wants_claude(&self, request: &str) -> bool {
+        normalise(request).split(' ').any(|w| {
+            let w = w.trim_end_matches('s');
+            CLAUDE_KEYWORDS.iter().any(|k| *k == w) || self.claude_keywords.iter().any(|k| k.trim_end_matches('s') == w)
+        })
     }
 
     /// Calls to run instead of asking a model: a learned request, else a matching recipe.
@@ -323,6 +340,18 @@ mod tests {
         assert_eq!(normalise("Fillet ALL edges 5mm."), "fillet all edges 5");
         assert_eq!(normalise("fillet all edges 5 millimetres, please"), "fillet all edges 5");
         assert_eq!(normalise("Add a 2.5 mm cube"), "add a 2.5 cube");
+    }
+
+    #[test]
+    fn keywords_send_hard_requests_to_claude() {
+        let mut h = Hints::default();
+        assert!(h.wants_claude("make the holes 10 mm and move them 5 mm closer"));
+        assert!(h.wants_claude("Cut a slot"));
+        assert!(!h.wants_claude("move plate 30mm to the left"));
+        assert!(!h.wants_claude("fillet all edges 5 mm"));
+        assert!(!h.wants_claude("wholesale changes"));
+        h.claude_keywords.push("dovetail".into());
+        assert!(h.wants_claude("add a dovetail"));
     }
 
     #[test]

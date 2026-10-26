@@ -281,6 +281,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
                 Err(e) => clip(format!("error: {e}")),
             }
         }
+        Some("escalate") => "no tool can do this request: it needs a more capable assistant".to_string(),
         Some("round") => round_edges(app, &v),
         Some("move") => {
             let n = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(0.0);
@@ -446,6 +447,12 @@ impl State {
             self.current = Some(Current { id, request: typed, tier, earlier: String::new(), calls: Vec::new() });
             self.pending = Some(calls);
             repaint();
+            return;
+        }
+        if self.has_key && !self.claude_off && self.hints.wants_claude(&request) {
+            self.log.push("· A request with several steps: asking Claude directly".to_string());
+            self.current = Some(Current { id, request: typed, tier: "claude", earlier: String::new(), calls: Vec::new() });
+            self.ask_claude(&request);
             return;
         }
         self.current = Some(Current { id, request: typed, tier: "apple", earlier: String::new(), calls: Vec::new() });
