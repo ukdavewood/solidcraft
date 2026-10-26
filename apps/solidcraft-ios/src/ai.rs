@@ -237,6 +237,47 @@ fn loop_guard(request: &str) -> Option<String> {
     None
 }
 
+/// Moves the camera: pan, zoom, rotate or a standard view. The model does not change.
+fn change_view(app: &mut SolveApp, v: &Value) -> String {
+    use solidcraft_engine::render::StandardView;
+    let action = v.get("action").and_then(Value::as_str).unwrap_or("").trim().to_lowercase().replace([' ', '-'], "_");
+    let amount = v.get("amount").and_then(Value::as_f64).filter(|a| a.is_finite() && *a > 0.0);
+    // The view's height only scales a pan, so a nominal one gives a pan in screen pixels.
+    const H: f64 = 800.0;
+    let pan = amount.unwrap_or(200.0).min(2000.0);
+    let degrees = amount.unwrap_or(45.0).min(360.0);
+    // Camera::orbit turns 0.008 radians per pixel.
+    let px = degrees.to_radians() / 0.008;
+    let zoom = amount.filter(|a| *a > 1.0).unwrap_or(2.0).min(20.0);
+    app.cam_anim = None;
+    match action.as_str() {
+        // The model moves the way the word says.
+        "pan_left" => app.cam.pan(-pan, 0.0, H),
+        "pan_right" => app.cam.pan(pan, 0.0, H),
+        "pan_up" => app.cam.pan(0.0, -pan, H),
+        "pan_down" => app.cam.pan(0.0, pan, H),
+        "zoom_in" => app.cam.zoom_at(1.0 / zoom, None),
+        "zoom_out" => app.cam.zoom_at(zoom, None),
+        "rotate_left" | "orbit_left" => app.cam.orbit(-px, 0.0),
+        "rotate_right" | "orbit_right" => app.cam.orbit(px, 0.0),
+        "rotate_up" | "orbit_up" => app.cam.orbit(0.0, px),
+        "rotate_down" | "orbit_down" => app.cam.orbit(0.0, -px),
+        "fit" | "home" | "zoom_to_fit" | "zoom_extents" => app.fit_view(),
+        other => {
+            let name = if other == "isometric" || other == "iso" { "iso" } else { other.trim_end_matches("_view") };
+            let Some(view) = StandardView::parse(name) else {
+                return "error: action must be pan_left, pan_right, pan_up, pan_down, zoom_in, zoom_out, rotate_left, rotate_right, rotate_up, rotate_down, front, back, left, right, top, bottom, isometric or fit".to_string();
+            };
+            let (yaw, pitch) = view.angles();
+            app.cam.yaw = yaw;
+            app.cam.pitch = pitch;
+            app.cam.roll = 0.0;
+            app.fit_view();
+        }
+    }
+    format!("ok: view {action}")
+}
+
 fn answer(app: &mut SolveApp, request: &str) -> String {
     let v: Value = serde_json::from_str(request).unwrap_or(Value::Null);
     match v.get("tool").and_then(Value::as_str) {
@@ -310,6 +351,7 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
                 Err(e) => clip(format!("error: {e}")),
             }
         }
+        Some("view") => change_view(app, &v),
         Some("escalate") => "no tool can do this request: it needs a more capable assistant".to_string(),
         Some("round") => round_edges(app, &v),
         Some("move") => {
