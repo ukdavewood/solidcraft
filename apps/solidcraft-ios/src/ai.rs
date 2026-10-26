@@ -320,6 +320,36 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
                 }
                 _ => return "error: kind must be box, cylinder or sphere".to_string(),
             };
+            let mut params = params;
+            // Optional position, and join or cut against an existing body, in the same step.
+            let at = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(0.0);
+            let position = json!([at("x"), at("y"), at("z")]);
+            if let Some(o) = params.as_object_mut() {
+                let key = match cmd {
+                    "solid.box" => "corner",
+                    "solid.cylinder" => "base",
+                    _ => "center",
+                };
+                if position != json!([0.0, 0.0, 0.0]) {
+                    o.insert(key.to_string(), position);
+                }
+            }
+            let operation = v.get("operation").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+            if ["join", "cut", "intersect"].contains(&operation.as_str()) {
+                let named = v.get("target").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+                let state = app.session.world_state();
+                let target = state
+                    .bodies
+                    .iter()
+                    .find(|x| !named.is_empty() && x.name.to_lowercase() == named)
+                    .or_else(|| state.bodies.iter().rev().find(|x| app.session.body_visible(&x.name)))
+                    .map(|x| x.name.clone());
+                let Some(target) = target else { return "error: no body to join to or cut".to_string() };
+                if let Some(o) = params.as_object_mut() {
+                    o.insert("operation".to_string(), json!(operation));
+                    o.insert("targets".to_string(), json!([target]));
+                }
+            }
             match app.run(cmd, params) {
                 Ok(r) => short_result(&r),
                 Err(e) => clip(format!("error: {e}")),
