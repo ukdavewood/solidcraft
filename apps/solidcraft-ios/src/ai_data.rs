@@ -34,6 +34,8 @@ const FOLLOW_UPS: &[&str] = &["continue", "go on", "carry on", "keep going", "ye
 
 /// The most text hints add to a prompt: the on-device model's memory is small.
 const MAX_HINT_CHARS: usize = 900;
+/// The most text the rules and examples add to a request for Claude.
+const MAX_HINT_CHARS_LONG: usize = 4000;
 
 pub fn dir() -> PathBuf {
     let d = crate::files::documents().join("ai");
@@ -244,7 +246,10 @@ impl Hints {
 
     /// The text put in front of a request for the on-device model: the extra rules and the
     /// few examples that share the most words with it, within [`MAX_HINT_CHARS`].
-    pub fn prompt(&self, request: &str) -> String {
+    ///
+    /// `long` is for Claude: all the rules, in up to [`MAX_HINT_CHARS_LONG`]. The on-device model has a
+    /// context of about 4,000 tokens and tools of its own, so it gets only the examples.
+    pub fn prompt(&self, request: &str, long: bool) -> String {
         let words: Vec<String> = normalise(request).split(' ').map(str::to_string).collect();
         let overlap = |text: &str| normalise(text).split(' ').filter(|w| words.iter().any(|x| x == w)).count();
         let mut pool: Vec<(usize, String)> = self.examples.iter().map(|(r, c)| (overlap(r), format!("- \"{r}\" -> {c}"))).collect();
@@ -257,7 +262,7 @@ impl Hints {
         pool.retain(|(score, _)| *score > 0);
         pool.sort_by(|a, b| b.0.cmp(&a.0));
         let mut text = String::new();
-        for line in self.instructions.iter().take(5) {
+        for line in self.instructions.iter().take(if long { 20 } else { 0 }) {
             text.push_str(line);
             text.push('\n');
         }
@@ -268,7 +273,7 @@ impl Hints {
                 text.push('\n');
             }
         }
-        let mut end = text.len().min(MAX_HINT_CHARS);
+        let mut end = text.len().min(if long { MAX_HINT_CHARS_LONG } else { MAX_HINT_CHARS });
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -383,7 +388,7 @@ mod tests {
         h.examples.push(("add a cube".into(), "add_shape(kind=box, size1=10, size2=10, size3=10)".into()));
         h.examples.push(("hide the lamps".into(), "show_hide(rule=\"-lamp\")".into()));
         h.instructions.push("Lengths are millimetres.".into());
-        let p = h.prompt("hide all the lamps please");
+        let p = h.prompt("hide all the lamps please", true);
         assert!(p.contains("hide the lamps") && !p.contains("add a cube") && p.ends_with("Request: hide all the lamps please"));
         let call = json!({"tool": "round", "kind": "chamfer", "size": 2.0, "which": "top", "body": ""});
         assert_eq!(describe_call(&call).unwrap(), "chamfer_edges(size=2, which=top, body=\"\")");

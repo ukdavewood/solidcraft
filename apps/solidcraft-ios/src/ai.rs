@@ -513,7 +513,12 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
                 .filter_map(|b| {
                     let name = b.get("name")?.as_str()?.to_string();
                     let (lo, hi) = (b.pointer("/bbox/min")?.as_array()?, b.pointer("/bbox/max")?.as_array()?);
-                    let axis = |i: usize, n: &str| Some(format!("{n} {:.1}..{:.1}", lo.get(i)?.as_f64()?, hi.get(i)?.as_f64()?));
+                    // Rounded to 0.1, with no "-0.0" (a small model reads that as a minus sign).
+                    let tidy = |v: f64| {
+                        let r = (v * 10.0).round() / 10.0;
+                        if r == 0.0 { 0.0 } else { r }
+                    };
+                    let axis = |i: usize, n: &str| Some(format!("{n} {:.1}..{:.1}", tidy(lo.get(i)?.as_f64()?), tidy(hi.get(i)?.as_f64()?)));
                     Some((name, format!(" [{}, {}, {}]", axis(0, "x")?, axis(1, "y")?, axis(2, "z")?)))
                 })
                 .collect();
@@ -799,7 +804,7 @@ impl State {
         if let Ok(mut a) = APPLE_REQUEST.lock() {
             *a = Some(ai_data::normalise(&request));
         }
-        let prompt = self.hints.prompt(&request);
+        let prompt = self.hints.prompt(&request, false);
         if let Ok(b) = self.bridge() {
             // Each request starts clean: the design is the memory, and the model's own is small.
             (b.reset)();
@@ -987,7 +992,7 @@ fn undoable(call: &Value, reply: &str) -> bool {
             *a = None;
         }
         let earlier = self.current.as_ref().map(|c| c.earlier.clone()).unwrap_or_default();
-        let mut prompt = self.hints.prompt(request);
+        let mut prompt = self.hints.prompt(request, true);
         if let Some((q, a)) = &self.last_exchange {
             prompt = format!("Previous request: {q}\nPrevious answer: {}\n{prompt}", a.chars().take(400).collect::<String>());
         }
