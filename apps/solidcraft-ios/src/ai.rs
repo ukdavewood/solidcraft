@@ -433,6 +433,10 @@ pub struct State {
     log: Vec<String>,
     busy: bool,
     listening: bool,
+    /// What was typed before Speak (the recogniser reports the whole phrase each time), when words last arrived (ms), and the user's choice not to send after a pause.
+    speech_base: String,
+    heard_at: u64,
+    no_auto_send: bool,
     /// The Claude tier: a key is saved; the user turned automatic hand-over off; the key being typed.
     has_key: bool,
     claude_off: bool,
@@ -465,6 +469,12 @@ impl State {
 
     /// Send what is typed: replay a learned request or recipe, else ask the on-device model.
     fn submit(&mut self, claude_only: bool) {
+        if self.listening {
+            self.listening = false;
+            if let Ok(b) = self.bridge() {
+                (b.listen_stop)();
+            }
+        }
         let typed = std::mem::take(&mut self.input).trim().to_string();
         self.log.push(format!("You: {typed}"));
         self.busy = true;
@@ -634,11 +644,18 @@ impl State {
                     self.listening = false;
                     self.log.push(text);
                 }
-                1 => {
-                    self.listening = false;
-                    self.input = text;
+                // Words that arrive after Stop or after the request was sent are dropped: they would overwrite what is there.
+                _ if !self.listening => {}
+                _ => {
+                    self.input = format!("{}{}", self.speech_base, text);
+                    self.heard_at = ai_data::now_millis();
+                    if kind == 1 {
+                        self.listening = false;
+                        if !self.no_auto_send && !self.busy && !self.input.trim().is_empty() {
+                            self.submit(false);
+                        }
+                    }
                 }
-                _ => self.input = text,
             }
         }
         let replayed = self.pending.take();
@@ -670,8 +687,20 @@ impl State {
     /// `lift`: how far a docked keyboard reaches up from the bottom of the screen (0: none).
     pub fn show(&mut self, ctx: &egui::Context, lift: f32) {
         let _ = CTX.set(ctx.clone());
+        if self.listening {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            // A pause after some words sends the request.
+            if !self.no_auto_send && !self.busy && !self.input.trim().is_empty() && ai_data::now_millis().saturating_sub(self.heard_at) > 1500 {
+                self.submit(false);
+            }
+        }
+        let pulse = if self.listening { 0.55 + 0.45 * (ctx.input(|i| i.time) * 5.0).sin().abs() as f32 } else { 0.0 };
         egui::Area::new(egui::Id::new("ai_button")).anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -96.0]).show(ctx, |ui| {
-            if ui.add_sized([56.0, 44.0], egui::Button::new("AI")).clicked() {
+            let mut ai_button = egui::Button::new("AI");
+            if self.listening {
+                ai_button = ai_button.fill(egui::Color32::from_rgb((220.0 * pulse) as u8, 30, 30));
+            }
+            if ui.add_sized([56.0, 44.0], ai_button).clicked() {
                 self.open = !self.open;
                 // Makes the Documents/ai folder (log, learned requests, hints) show in Files.
                 self.hints.refresh();
@@ -687,7 +716,15 @@ impl State {
                 Ok(_) => self.availability.clone(),
                 Err(e) => format!("not available: {e}"),
             };
-            ui.label(egui::RichText::new(if self.listening { format!("{status} · listening…") } else { status }).weak());
+            if self.listening {
+                ui.label(egui::RichText::new("● Listening… speak, then pause to send").strong().color(egui::Color32::from_rgb((255.0 * pulse) as u8, 60, 60)));
+            } else {
+                ui.label(egui::RichText::new(status).weak());
+            }
+            let mut auto = !self.no_auto_send;
+            if ui.checkbox(&mut auto, "Send after a pause when speaking").changed() {
+                self.no_auto_send = !auto;
+            }
             egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).show(ui, |ui| {
                 for line in &self.log {
                     ui.label(line);
@@ -765,8 +802,8 @@ impl State {
                         self.input.push_str(text.trim());
                     }
                 }
-                let speak = if self.listening { "Stop" } else { "Speak" };
-                if ui.button(speak).clicked() {
+                let speak = if self.listening { egui::Button::new("Stop").fill(egui::Color32::from_rgb(190, 40, 40)) } else { egui::Button::new("Speak") };
+                if ui.add(speak).clicked() {
                     let was_listening = self.listening;
                     if let Ok(b) = self.bridge() {
                         if was_listening {
@@ -775,6 +812,10 @@ impl State {
                             (b.listen_start)(spoken_cb);
                         }
                         self.listening = !was_listening;
+                        if self.listening {
+                            self.speech_base = if self.input.trim().is_empty() { String::new() } else { format!("{} ", self.input.trim_end()) };
+                            self.heard_at = ai_data::now_millis();
+                        }
                     }
                 }
                 if ui.button("New chat").clicked() {
