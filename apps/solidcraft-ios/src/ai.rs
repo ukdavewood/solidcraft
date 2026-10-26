@@ -34,6 +34,8 @@ static CALLS: Mutex<Vec<(Value, String)>> = Mutex::new(Vec::new());
 static APPLE_REQUEST: Mutex<Option<String>> = Mutex::new(None);
 /// Every call of the request being answered, for the loop guard (CALLS is emptied into the log each frame).
 static GUARD: Mutex<Vec<(Value, String)>> = Mutex::new(Vec::new());
+/// Progress and results of the local model's download: text and a kind (0 progress, 1 ready, 2 error).
+static LOCAL: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 /// Words that end speaking (or cancel a request) instead of being sent as one.
@@ -74,6 +76,15 @@ extern "C" fn done_cb(answer: *const c_char) {
     repaint();
 }
 
+extern "C" fn local_cb(text: *const c_char, kind: i32) {
+    // SAFETY: as above.
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+    if let Ok(mut s) = LOCAL.lock() {
+        s.push((text, kind));
+    }
+    repaint();
+}
+
 extern "C" fn spoken_cb(text: *const c_char, kind: i32) {
     // SAFETY: as above.
     let text = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
@@ -96,6 +107,11 @@ struct Bridge {
     clear_key: extern "C" fn(),
     usage: extern "C" fn() -> *mut c_char,
     paste: extern "C" fn() -> *mut c_char,
+    local_state: extern "C" fn() -> *mut c_char,
+    local_load: extern "C" fn(TextFn),
+    local_unload: extern "C" fn(),
+    local_ask: extern "C" fn(*const c_char, DoneFn),
+    online: extern "C" fn() -> i32,
 }
 
 fn load() -> Result<Bridge, String> {
@@ -132,6 +148,11 @@ fn load() -> Result<Bridge, String> {
             clear_key: std::mem::transmute(sym(c"sc_ai_clear_key")?),
             usage: std::mem::transmute(sym(c"sc_ai_claude_usage")?),
             paste: std::mem::transmute(sym(c"sc_ai_paste")?),
+            local_state: std::mem::transmute(sym(c"sc_ai_local_state")?),
+            local_load: std::mem::transmute(sym(c"sc_ai_local_load")?),
+            local_unload: std::mem::transmute(sym(c"sc_ai_local_unload")?),
+            local_ask: std::mem::transmute(sym(c"sc_ai_local_ask")?),
+            online: std::mem::transmute(sym(c"sc_ai_online")?),
         })
     }
 }
@@ -515,6 +536,9 @@ pub struct State {
     log: Vec<String>,
     busy: bool,
     listening: bool,
+    /// The local model: "none", "loading" or "ready"; and the download's progress text.
+    local_state: String,
+    local_progress: String,
     /// What was typed before Speak (the recogniser reports the whole phrase each time), when words last arrived (ms), and the user's choice not to send after a pause.
     speech_base: String,
     heard_at: u64,
@@ -627,11 +651,22 @@ impl State {
             repaint();
             return;
         }
-        if self.has_key && !self.claude_off && self.hints.wants_claude(&request) {
-            self.log.push("· A request with several steps: asking Claude directly".to_string());
-            self.current = Some(Current { id, request: typed, tier: "claude", earlier: String::new(), calls: Vec::new() });
-            self.ask_claude(&request);
-            return;
+        if self.hints.wants_claude(&request) {
+            match self.second_tier() {
+                Some("claude") => {
+                    self.log.push("· A request with several steps: asking Claude directly".to_string());
+                    self.current = Some(Current { id, request: typed, tier: "claude", earlier: String::new(), calls: Vec::new() });
+                    self.ask_claude(&request);
+                    return;
+                }
+                Some(_) => {
+                    self.log.push("· A request with several steps, and no internet: asking the local model".to_string());
+                    self.current = Some(Current { id, request: typed, tier: "local", earlier: String::new(), calls: Vec::new() });
+                    self.ask_local(&request);
+                    return;
+                }
+                None => {}
+            }
         }
         self.current = Some(Current { id, request: typed, tier: "apple", earlier: String::new(), calls: Vec::new() });
         if let Ok(mut a) = APPLE_REQUEST.lock() {
@@ -643,6 +678,38 @@ impl State {
             (b.reset)();
             if let Ok(c) = CString::new(prompt.replace('\0', " ")) {
                 (b.ask)(c.as_ptr(), done_cb);
+            }
+        }
+    }
+
+    /// Whether the iPad has a network path.
+    fn online(&mut self) -> bool {
+        self.bridge().map(|b| (b.online)() == 1).unwrap_or(true)
+    }
+
+    /// Which model answers what the on-device one can't: Claude when online with a key, else the local model.
+    fn second_tier(&mut self) -> Option<&'static str> {
+        if self.has_key && !self.claude_off && self.online() {
+            Some("claude")
+        } else if self.local_state == "ready" {
+            Some("local")
+        } else {
+            None
+        }
+    }
+
+    /// Ask the local model (the offline tier): the same tools, running on the iPad.
+    fn ask_local(&mut self, request: &str) {
+        if let Ok(mut g) = GUARD.lock() {
+            g.clear();
+        }
+        if let Ok(mut a) = APPLE_REQUEST.lock() {
+            *a = None;
+        }
+        let prompt = self.hints.prompt(request);
+        if let Ok(b) = self.bridge() {
+            if let Ok(p) = CString::new(prompt.replace('\0', " ")) {
+                (b.local_ask)(p.as_ptr(), done_cb);
             }
         }
     }
@@ -704,6 +771,14 @@ impl State {
             Err(_) => (false, String::new()),
         };
         self.has_key = has;
+        if let Ok(b) = self.bridge() {
+            let p = (b.local_state)();
+            if !p.is_null() {
+                // SAFETY: the framework returns a `strdup`ed C string.
+                self.local_state = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+                unsafe { libc::free(p.cast()) };
+            }
+        }
         self.usage = serde_json::from_str::<Value>(&usage)
             .map(|u| format!("Claude so far: {} requests, {} tokens in, {} out", u["requests"], u["input"], u["output"]))
             .unwrap_or_default();
@@ -721,7 +796,8 @@ impl State {
             && !cur.calls.is_empty()
             && cur.calls.iter().all(|(_, r)| !(r.starts_with("error") || r.starts_with("refused") || r.starts_with("no ")));
         // The on-device model could not do it: hand over to Claude, telling it what was already done.
-        let escalate = cur.tier == "apple" && !clean && self.has_key && !self.claude_off;
+        let second = if cur.tier == "apple" && !clean { self.second_tier() } else { None };
+        let escalate = second.is_some();
         ai_data::log(&json!({
             "kind": "request", "id": cur.id, "t": cur.id / 1000, "request": cur.request, "tier": cur.tier,
             "calls": cur.calls.iter().map(|(c, r)| json!({ "call": c, "reply": r })).collect::<Vec<_>>(),
@@ -734,10 +810,17 @@ impl State {
                 .filter(|(c, r)| r.starts_with("ok") && c.get("tool").and_then(Value::as_str).is_some_and(|t| t != "find" && t != "inspect"))
                 .filter_map(|(c, r)| Some(format!("{} -> {r}", ai_data::describe_call(c)?)))
                 .collect();
-            self.log.push("· The on-device model couldn't do that: asking Claude…".to_string());
             let id = ai_data::now_millis();
-            self.current = Some(Current { id, request: cur.request.clone(), tier: "claude", earlier: done.join("; "), calls: Vec::new() });
-            self.ask_claude(&self.hints.rewrite(&cur.request));
+            let request = self.hints.rewrite(&cur.request);
+            if second == Some("claude") {
+                self.log.push("· The on-device model couldn't do that: asking Claude…".to_string());
+                self.current = Some(Current { id, request: cur.request.clone(), tier: "claude", earlier: done.join("; "), calls: Vec::new() });
+                self.ask_claude(&request);
+            } else {
+                self.log.push("· The on-device model couldn't do that, and there is no internet: asking the local model…".to_string());
+                self.current = Some(Current { id, request: cur.request.clone(), tier: "local", earlier: done.join("; "), calls: Vec::new() });
+                self.ask_local(&request);
+            }
             return;
         }
         self.busy = false;
@@ -753,7 +836,7 @@ impl State {
         ai_data::log(&json!({ "kind": "feedback", "id": r.id, "t": ai_data::now_millis() / 1000, "value": value }));
         match value {
             "good" => {
-                if (r.tier == "apple" || r.tier == "claude") && r.clean {
+                if matches!(r.tier, "apple" | "claude" | "local") && r.clean {
                     // Only the calls that changed something: looking things up is not part of a recipe.
                     let changing: Vec<Value> = r.calls.iter().filter(|c| !matches!(c.get("tool").and_then(Value::as_str), Some("find" | "inspect"))).cloned().collect();
                     self.hints.learn(&r.request, &changing);
@@ -807,6 +890,21 @@ impl State {
                             self.start_listening();
                         }
                     }
+                }
+            }
+        }
+        for (text, kind) in LOCAL.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default() {
+            match kind {
+                0 => self.local_progress = text,
+                1 => {
+                    self.local_state = "ready".to_string();
+                    self.local_progress.clear();
+                    self.log.push("· The local model is ready for offline use".to_string());
+                }
+                _ => {
+                    self.local_state = "none".to_string();
+                    self.local_progress.clear();
+                    self.log.push(text);
                 }
             }
         }
@@ -904,6 +1002,26 @@ impl State {
                     }
                 });
             }
+            ui.collapsing("Local model (offline)", |ui| {
+                ui.label("Used when there is no internet. It downloads once (about 2.3 GB, over Wi-Fi) and then works offline.");
+                match self.local_state.as_str() {
+                    "ready" => {
+                        ui.label("Ready.");
+                    }
+                    "loading" => {
+                        ui.label(format!("Downloading… {}", self.local_progress));
+                    }
+                    _ => {
+                        if ui.button("Download the local model").clicked() {
+                            self.local_state = "loading".to_string();
+                            self.local_progress = "0%".to_string();
+                            if let Ok(b) = self.bridge() {
+                                (b.local_load)(local_cb);
+                            }
+                        }
+                    }
+                }
+            });
             ui.collapsing("Claude (second tier)", |ui| {
                 if self.has_key {
                     ui.label("Key saved in the Keychain. Claude is asked only when the on-device model can't do a request, or with Ask Claude.");
@@ -952,6 +1070,16 @@ impl State {
                 }
                 if self.has_key && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new("Ask Claude")).clicked() {
                     self.submit(true);
+                }
+                if self.local_state == "ready" && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new("Ask local")).clicked() {
+                    let typed = self.input.trim().to_string();
+                    self.input.clear();
+                    self.log.push(format!("You: {typed}"));
+                    self.busy = true;
+                    self.last = None;
+                    let id = ai_data::now_millis();
+                    self.current = Some(Current { id, request: typed.clone(), tier: "local", earlier: String::new(), calls: Vec::new() });
+                    self.ask_local(&self.hints.rewrite(&typed));
                 }
                 if ui.button("Paste").clicked() {
                     self.stop_speaking();
