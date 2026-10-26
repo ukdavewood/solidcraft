@@ -371,7 +371,8 @@ impl State {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
+    /// `lift`: how far a docked keyboard reaches up from the bottom of the screen (0: none).
+    pub fn show(&mut self, ctx: &egui::Context, lift: f32) {
         let _ = CTX.set(ctx.clone());
         egui::Area::new(egui::Id::new("ai_button")).anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -96.0]).show(ctx, |ui| {
             if ui.add_sized([56.0, 44.0], egui::Button::new("AI")).clicked() {
@@ -382,7 +383,7 @@ impl State {
             return;
         }
         let mut open = self.open;
-        egui::Window::new("AI (on-device)").open(&mut open).default_width(420.0).anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -150.0]).show(ctx, |ui| {
+        egui::Window::new("AI (on-device)").open(&mut open).default_width(420.0).anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, if lift > 0.0 { -(lift + 12.0) } else { -150.0 }]).show(ctx, |ui| {
             let status = match self.bridge() {
                 Ok(_) => self.availability.clone(),
                 Err(e) => format!("not available: {e}"),

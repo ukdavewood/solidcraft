@@ -95,7 +95,9 @@ impl eframe::App for App {
         keyboard::set_numeric(solidcraft_ui_egui::numeric_focus(ui.ctx()));
         self.files.show(ui.ctx());
         #[cfg(target_os = "ios")]
-        self.ai.show(ui.ctx());
+        // The AI window rides above a docked keyboard.
+        let lift = (keyboard::covered() - ui.ctx().input(|i| i.safe_area_insets().0.bottom)).max(0.0);
+        self.ai.show(ui.ctx(), lift);
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, self.solve.prefs());
