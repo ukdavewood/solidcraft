@@ -9,6 +9,8 @@
 mod files;
 #[cfg(target_os = "ios")]
 mod ai;
+#[cfg(any(target_os = "ios", test))]
+mod ai_data;
 #[cfg(target_os = "ios")]
 mod keyboard;
 #[cfg(target_os = "ios")]
@@ -96,8 +98,11 @@ impl eframe::App for App {
         self.files.show(ui.ctx());
         #[cfg(target_os = "ios")]
         // The AI window rides above a docked keyboard.
-        let lift = (keyboard::covered() - ui.ctx().input(|i| i.safe_area_insets().0.bottom)).max(0.0);
-        self.ai.show(ui.ctx(), lift);
+        #[cfg(target_os = "ios")]
+        {
+            let lift = (keyboard::covered() - ui.ctx().input(|i| i.safe_area_insets().0.bottom)).max(0.0);
+            self.ai.show(ui.ctx(), lift);
+        }
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, self.solve.prefs());

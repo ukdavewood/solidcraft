@@ -28,11 +28,11 @@ solidcraft-ui-egui = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 log = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
 libc = "0.2"
-serde_json = { workspace = true }
 objc2-foundation = { version = "0.3", features = ["block2"] }
 block2 = "0.6"
 objc2-ui-kit = { version = "0.3", features = ["objc2-uniform-type-identifiers"] }

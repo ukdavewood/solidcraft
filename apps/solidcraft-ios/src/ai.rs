@@ -14,6 +14,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use solidcraft_ui_egui::SolveApp;
 
+use crate::ai_data::{self, Hints};
+
 type ExecFn = extern "C" fn(*const c_char) -> *mut c_char;
 type DoneFn = extern "C" fn(*const c_char);
 type TextFn = extern "C" fn(*const c_char, i32);
@@ -26,6 +28,8 @@ static ANSWERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Words from the microphone: the text and its kind (0 so far, 1 final, 2 an error).
 static SPOKEN: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
+/// The tool calls of the request being answered, as sent and as answered, for the log.
+static CALLS: Mutex<Vec<(Value, String)>> = Mutex::new(Vec::new());
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 /// The longest tool answer: the model's context is small.
@@ -186,6 +190,9 @@ fn clip(mut text: String) -> String {
 /// Answer one tool request from the model.
 fn handle(app: &mut SolveApp, request: &str) -> String {
     let reply = answer(app, request);
+    if let (Ok(mut calls), Ok(call)) = (CALLS.lock(), serde_json::from_str::<Value>(request)) {
+        calls.push((call, reply.clone()));
+    }
     if let Ok(mut t) = TRACE.lock() {
         t.push(format!("· {} → {}", request.chars().take(160).collect::<String>(), reply.chars().take(100).collect::<String>()));
     }
@@ -295,8 +302,31 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
 }
 
 /// The AI box: a button, and a window to type a request in.
+/// The request being answered.
+struct Current {
+    id: u64,
+    request: String,
+    tier: &'static str,
+    calls: Vec<(Value, String)>,
+}
+
+/// The last request, waiting to be rated Good or Bad.
+struct Rated {
+    id: u64,
+    request: String,
+    tier: &'static str,
+    calls: Vec<Value>,
+    /// Every call went through (nothing refused or failed).
+    clean: bool,
+}
+
 #[derive(Default)]
 pub struct State {
+    hints: Hints,
+    current: Option<Current>,
+    /// Calls from a learned request or recipe, run on the next frame.
+    pending: Option<Vec<Value>>,
+    last: Option<Rated>,
     open: bool,
     input: String,
     log: Vec<String>,
@@ -327,17 +357,65 @@ impl State {
         }
     }
 
-    /// Send what is typed to the model.
+    /// Send what is typed: replay a learned request or recipe, else ask the on-device model.
     fn submit(&mut self) {
-        let prompt = std::mem::take(&mut self.input);
-        self.log.push(format!("You: {prompt}"));
+        let typed = std::mem::take(&mut self.input).trim().to_string();
+        self.log.push(format!("You: {typed}"));
         self.busy = true;
+        self.last = None;
+        self.hints.refresh();
+        let request = self.hints.rewrite(&typed);
+        let id = ai_data::now_millis();
+        if let Some((tier, calls)) = self.hints.replay(&request) {
+            self.current = Some(Current { id, request: typed, tier, calls: Vec::new() });
+            self.pending = Some(calls);
+            repaint();
+            return;
+        }
+        self.current = Some(Current { id, request: typed, tier: "apple", calls: Vec::new() });
+        let prompt = self.hints.prompt(&request);
         if let Ok(b) = self.bridge() {
             // Each request starts clean: the design is the memory, and the model's own is small.
             (b.reset)();
-            if let Ok(c) = CString::new(prompt.trim().replace('\0', " ")) {
+            if let Ok(c) = CString::new(prompt.replace('\0', " ")) {
                 (b.ask)(c.as_ptr(), done_cb);
             }
+        }
+    }
+
+    /// Write the finished request to the log and offer to rate it.
+    fn finish(&mut self, answer: String) {
+        self.busy = false;
+        self.log.push(format!("AI: {answer}"));
+        let Some(cur) = self.current.take() else { return };
+        let error = answer.starts_with("error");
+        ai_data::log(&json!({
+            "kind": "request", "id": cur.id, "t": cur.id / 1000, "request": cur.request, "tier": cur.tier,
+            "calls": cur.calls.iter().map(|(c, r)| json!({ "call": c, "reply": r })).collect::<Vec<_>>(),
+            "answer": answer, "error": error,
+        }));
+        let clean = !error
+            && !cur.calls.is_empty()
+            && cur.calls.iter().all(|(_, r)| !(r.starts_with("error") || r.starts_with("refused") || r.starts_with("no ")));
+        self.last = Some(Rated { id: cur.id, request: cur.request, tier: cur.tier, calls: cur.calls.into_iter().map(|(c, _)| c).collect(), clean });
+    }
+
+    /// Good or Bad for the last request: logged, and a Good one from the model is remembered.
+    fn rate(&mut self, good: bool) {
+        let Some(r) = self.last.take() else { return };
+        ai_data::log(&json!({ "kind": "feedback", "id": r.id, "t": ai_data::now_millis() / 1000, "value": if good { "good" } else { "bad" } }));
+        if good {
+            if r.tier == "apple" && r.clean {
+                self.hints.learn(&r.request, &r.calls);
+                self.log.push("· Good: remembered, the same request now runs at once".to_string());
+            } else {
+                self.log.push("· Good".to_string());
+            }
+        } else {
+            if r.tier == "learned" {
+                self.hints.forget(&r.request);
+            }
+            self.log.push("· Bad: logged for review".to_string());
         }
     }
 
@@ -364,10 +442,24 @@ impl State {
                 _ => self.input = text,
             }
         }
+        let replayed = self.pending.take();
+        if let Some(calls) = &replayed {
+            for call in calls {
+                handle(app, &call.to_string());
+            }
+        }
+        if let Some(cur) = self.current.as_mut() {
+            cur.calls.extend(CALLS.lock().map(|mut c| std::mem::take(&mut *c)).unwrap_or_default());
+        } else if let Ok(mut c) = CALLS.lock() {
+            c.clear();
+        }
+        if replayed.is_some() {
+            let said = self.current.as_ref().map(|c| c.calls.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join("; ")).unwrap_or_default();
+            self.finish(format!("(saved request) {said}"));
+        }
         let answers: Vec<_> = ANSWERS.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
         for a in answers {
-            self.busy = false;
-            self.log.push(format!("AI: {a}"));
+            self.finish(a);
         }
     }
 
@@ -377,6 +469,8 @@ impl State {
         egui::Area::new(egui::Id::new("ai_button")).anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -96.0]).show(ctx, |ui| {
             if ui.add_sized([56.0, 44.0], egui::Button::new("AI")).clicked() {
                 self.open = !self.open;
+                // Makes the Documents/ai folder (log, learned requests, hints) show in Files.
+                self.hints.refresh();
             }
         });
         if !self.open {
@@ -397,6 +491,17 @@ impl State {
                     ui.label("…thinking");
                 }
             });
+            if self.last.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Was that right?");
+                    if ui.button("Good").clicked() {
+                        self.rate(true);
+                    }
+                    if ui.button("Bad").clicked() {
+                        self.rate(false);
+                    }
+                });
+            }
             ui.separator();
             // Enter asks; Shift+Enter is a new line.
             let id = egui::Id::new("ai_input");
