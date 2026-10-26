@@ -246,7 +246,10 @@ fn loop_guard(request: &str) -> Option<String> {
 fn change_view(app: &mut SolveApp, v: &Value) -> String {
     use solidcraft_engine::render::StandardView;
     let action = v.get("action").and_then(Value::as_str).unwrap_or("").trim().to_lowercase().replace([' ', '-'], "_");
-    let amount = v.get("amount").and_then(Value::as_f64).filter(|a| a.is_finite() && *a > 0.0);
+    // A negative amount goes the other way.
+    let signed = v.get("amount").and_then(Value::as_f64).filter(|a| a.is_finite() && *a != 0.0);
+    let sign = if signed.is_some_and(|a| a < 0.0) { -1.0 } else { 1.0 };
+    let amount = signed.map(f64::abs);
     // The view's height only scales a pan, so a nominal one gives a pan in screen pixels.
     const H: f64 = 800.0;
     let pan = amount.unwrap_or(200.0).min(2000.0);
@@ -257,27 +260,25 @@ fn change_view(app: &mut SolveApp, v: &Value) -> String {
     app.cam_anim = None;
     match action.as_str() {
         // The model moves the way the word says.
-        "pan_left" => app.cam.pan(-pan, 0.0, H),
-        "pan_right" => app.cam.pan(pan, 0.0, H),
-        "pan_up" => app.cam.pan(0.0, -pan, H),
-        "pan_down" => app.cam.pan(0.0, pan, H),
+        "pan_left" => app.cam.pan(-sign * pan, 0.0, H),
+        "pan_right" => app.cam.pan(sign * pan, 0.0, H),
+        "pan_up" => app.cam.pan(0.0, -sign * pan, H),
+        "pan_down" => app.cam.pan(0.0, sign * pan, H),
         "zoom_in" => app.cam.zoom_at(1.0 / zoom, None),
         "zoom_out" => app.cam.zoom_at(zoom, None),
-        "rotate_left" | "orbit_left" => app.cam.orbit(-px, 0.0),
-        "rotate_right" | "orbit_right" => app.cam.orbit(px, 0.0),
-        "rotate_up" | "orbit_up" => app.cam.orbit(0.0, px),
-        "rotate_down" | "orbit_down" => app.cam.orbit(0.0, -px),
-        "fit" | "home" | "zoom_to_fit" | "zoom_extents" => app.fit_view(),
+        "rotate_left" | "orbit_left" | "turn_left" => app.cam.orbit(-sign * px, 0.0),
+        "rotate_right" | "orbit_right" | "turn_right" => app.cam.orbit(sign * px, 0.0),
+        "rotate_up" | "orbit_up" | "tilt_up" => app.cam.orbit(0.0, sign * px),
+        "rotate_down" | "orbit_down" | "tilt_down" => app.cam.orbit(0.0, -sign * px),
+        // The same moves as the view buttons: animated, and Home is the isometric view fitted.
+        "home" | "home_view" => app.animate_view("home"),
+        "fit" | "zoom_to_fit" | "zoom_extents" => app.animate_view("fit"),
         other => {
-            let name = if other == "isometric" || other == "iso" { "iso" } else { other.trim_end_matches("_view") };
-            let Some(view) = StandardView::parse(name) else {
-                return "error: action must be pan_left, pan_right, pan_up, pan_down, zoom_in, zoom_out, rotate_left, rotate_right, rotate_up, rotate_down, front, back, left, right, top, bottom, isometric or fit".to_string();
-            };
-            let (yaw, pitch) = view.angles();
-            app.cam.yaw = yaw;
-            app.cam.pitch = pitch;
-            app.cam.roll = 0.0;
-            app.fit_view();
+            let name = if other == "isometric" { "iso" } else { other.trim_end_matches("_view") };
+            if StandardView::parse(name).is_none() {
+                return "error: action must be pan_left, pan_right, pan_up, pan_down, zoom_in, zoom_out, rotate_left, rotate_right, tilt_up, tilt_down, front, back, left, right, top, bottom, isometric, home or fit".to_string();
+            }
+            app.animate_view(name);
         }
     }
     format!("ok: view {action}")
