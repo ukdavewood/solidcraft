@@ -730,7 +730,9 @@ impl State {
         if let Ok(mut a) = APPLE_REQUEST.lock() {
             *a = None;
         }
-        let prompt = self.hints.prompt(request);
+        // The hints are rules for Claude's commands; the local model has its own instructions, and the
+        // design is added to the request on the Swift side.
+        let prompt = request.to_string();
         if let Ok(b) = self.bridge() {
             if let Ok(p) = CString::new(prompt.replace('\0', " ")) {
                 (b.local_ask)(p.as_ptr(), done_cb);
