@@ -88,6 +88,7 @@ struct Bridge {
     set_key: extern "C" fn(*const c_char) -> i32,
     clear_key: extern "C" fn(),
     usage: extern "C" fn() -> *mut c_char,
+    paste: extern "C" fn() -> *mut c_char,
 }
 
 fn load() -> Result<Bridge, String> {
@@ -123,6 +124,7 @@ fn load() -> Result<Bridge, String> {
             set_key: std::mem::transmute(sym(c"sc_ai_set_key")?),
             clear_key: std::mem::transmute(sym(c"sc_ai_clear_key")?),
             usage: std::mem::transmute(sym(c"sc_ai_claude_usage")?),
+            paste: std::mem::transmute(sym(c"sc_ai_paste")?),
         })
     }
 }
@@ -425,6 +427,19 @@ impl State {
         }
     }
 
+    /// The clipboard's text (iOS asks to allow pasting the first time).
+    fn clipboard(&mut self) -> String {
+        let Ok(b) = self.bridge() else { return String::new() };
+        let p = (b.paste)();
+        if p.is_null() {
+            return String::new();
+        }
+        // SAFETY: the framework returns a `strdup`ed C string.
+        let text = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        unsafe { libc::free(p.cast()) };
+        text
+    }
+
     /// Whether a Claude key is saved, and the usage so far.
     fn refresh_key(&mut self) {
         let (has, usage) = match self.bridge() {
@@ -604,7 +619,16 @@ impl State {
                     }
                 } else {
                     ui.label("Paste an Anthropic API key to let Claude help with requests the on-device model can't do. Requests then leave the device when that happens.");
-                    ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).desired_width(f32::INFINITY).hint_text("sk-ant-…"));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).desired_width(ui.available_width() - 90.0).hint_text("sk-ant-…"));
+                        if ui.button("Paste").clicked() {
+                            let text = self.clipboard();
+                            self.key_input = text.trim().to_string();
+                        }
+                    });
+                    if !self.key_input.is_empty() {
+                        ui.label(egui::RichText::new(format!("{} characters entered", self.key_input.chars().count())).weak());
+                    }
                     if ui.add_enabled(!self.key_input.trim().is_empty(), egui::Button::new("Save key")).clicked() {
                         let key = std::mem::take(&mut self.key_input);
                         if let (Ok(b), Ok(c)) = (self.bridge(), CString::new(key.trim())) {
@@ -627,6 +651,15 @@ impl State {
                 }
                 if self.has_key && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new("Ask Claude")).clicked() {
                     self.submit(true);
+                }
+                if ui.button("Paste").clicked() {
+                    let text = self.clipboard();
+                    if !text.is_empty() {
+                        if !self.input.is_empty() && !self.input.ends_with(' ') {
+                            self.input.push(' ');
+                        }
+                        self.input.push_str(text.trim());
+                    }
                 }
                 let speak = if self.listening { "Stop" } else { "Speak" };
                 if ui.button(speak).clicked() {
