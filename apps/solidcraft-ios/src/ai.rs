@@ -504,6 +504,8 @@ pub struct State {
     speech_base: String,
     heard_at: u64,
     no_auto_send: bool,
+    /// Speak keeps listening for the next command until Stop, typing or Paste.
+    continuous: bool,
     /// The Claude tier: a key is saved; the user turned automatic hand-over off; the key being typed.
     has_key: bool,
     claude_off: bool,
@@ -534,8 +536,42 @@ impl State {
         }
     }
 
+    /// Start the microphone (the words so far are kept as the start of the next phrase).
+    fn start_listening(&mut self) {
+        let base = if self.input.trim().is_empty() { String::new() } else { format!("{} ", self.input.trim_end()) };
+        if let Ok(b) = self.bridge() {
+            (b.listen_start)(spoken_cb);
+            self.listening = true;
+            self.speech_base = base;
+            self.heard_at = ai_data::now_millis();
+        }
+    }
+
+    /// Speech ends where typing, Paste or Stop begins.
+    fn stop_speaking(&mut self) {
+        self.continuous = false;
+        if self.listening {
+            self.listening = false;
+            if let Ok(b) = self.bridge() {
+                (b.listen_stop)();
+            }
+        }
+    }
+
+    /// Send what was said, then listen for the next command.
+    fn submit_spoken(&mut self) {
+        let keep = self.continuous;
+        self.submit(false);
+        self.continuous = keep;
+        if keep {
+            self.start_listening();
+        }
+    }
+
     /// Send what is typed: replay a learned request or recipe, else ask the on-device model.
     fn submit(&mut self, claude_only: bool) {
+        // Sent by hand: the microphone stops (a spoken send turns it back on).
+        self.continuous = false;
         if self.listening {
             self.listening = false;
             if let Ok(b) = self.bridge() {
@@ -709,7 +745,13 @@ impl State {
             match kind {
                 2 => {
                     self.listening = false;
-                    self.log.push(text);
+                    // Nothing heard for a while is not a reason to stop.
+                    if self.continuous && (text.contains("No speech") || text.contains("1110")) {
+                        self.start_listening();
+                    } else {
+                        self.continuous = false;
+                        self.log.push(text);
+                    }
                 }
                 // Words that arrive after Stop or after the request was sent are dropped: they would overwrite what is there.
                 _ if !self.listening => {}
@@ -719,7 +761,9 @@ impl State {
                     if kind == 1 {
                         self.listening = false;
                         if !self.no_auto_send && !self.busy && !self.input.trim().is_empty() {
-                            self.submit(false);
+                            self.submit_spoken();
+                        } else if self.continuous {
+                            self.start_listening();
                         }
                     }
                 }
@@ -763,7 +807,7 @@ impl State {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             // A pause after some words sends the request.
             if !self.no_auto_send && !self.busy && !self.input.trim().is_empty() && ai_data::now_millis().saturating_sub(self.heard_at) > 1500 {
-                self.submit(false);
+                self.submit_spoken();
             }
         }
         let pulse = if self.listening { 0.55 + 0.45 * (ctx.input(|i| i.time) * 5.0).sin().abs() as f32 } else { 0.0 };
@@ -789,7 +833,7 @@ impl State {
                 Err(e) => format!("not available: {e}"),
             };
             if self.listening {
-                ui.label(egui::RichText::new("● Listening… speak, then pause to send").strong().color(egui::Color32::from_rgb((255.0 * pulse) as u8, 60, 60)));
+                ui.label(egui::RichText::new("● Listening… say a command; tap Stop to end").strong().color(egui::Color32::from_rgb((255.0 * pulse) as u8, 60, 60)));
             } else {
                 ui.label(egui::RichText::new(status).weak());
             }
@@ -856,7 +900,10 @@ impl State {
             // Enter asks; Shift+Enter is a new line.
             let id = egui::Id::new("ai_input");
             let enter = ui.memory(|m| m.has_focus(id)) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-            ui.add(egui::TextEdit::multiline(&mut self.input).id(id).desired_rows(2).desired_width(f32::INFINITY).hint_text("Ask SolidCraft to do something"));
+            let edit = ui.add(egui::TextEdit::multiline(&mut self.input).id(id).desired_rows(2).desired_width(f32::INFINITY).hint_text("Ask SolidCraft to do something"));
+            if edit.changed() {
+                self.stop_speaking();
+            }
             ui.horizontal(|ui| {
                 let ready = !self.busy && !self.input.trim().is_empty() && self.availability == "available";
                 if (ui.add_enabled(ready, egui::Button::new("Ask")).clicked() || (enter && ready)) && ready {
@@ -866,6 +913,7 @@ impl State {
                     self.submit(true);
                 }
                 if ui.button("Paste").clicked() {
+                    self.stop_speaking();
                     let text = self.clipboard();
                     if !text.is_empty() {
                         if !self.input.is_empty() && !self.input.ends_with(' ') {
@@ -876,18 +924,11 @@ impl State {
                 }
                 let speak = if self.listening { egui::Button::new("Stop").fill(egui::Color32::from_rgb(190, 40, 40)) } else { egui::Button::new("Speak") };
                 if ui.add(speak).clicked() {
-                    let was_listening = self.listening;
-                    if let Ok(b) = self.bridge() {
-                        if was_listening {
-                            (b.listen_stop)();
-                        } else {
-                            (b.listen_start)(spoken_cb);
-                        }
-                        self.listening = !was_listening;
-                        if self.listening {
-                            self.speech_base = if self.input.trim().is_empty() { String::new() } else { format!("{} ", self.input.trim_end()) };
-                            self.heard_at = ai_data::now_millis();
-                        }
+                    if self.listening || self.continuous {
+                        self.stop_speaking();
+                    } else {
+                        self.continuous = !self.no_auto_send;
+                        self.start_listening();
                     }
                 }
                 if ui.button("New chat").clicked() {
