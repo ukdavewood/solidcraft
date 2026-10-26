@@ -208,7 +208,7 @@ fn clip_to(mut text: String, max: usize) -> String {
 
 /// Answer one tool request from the model.
 fn handle(app: &mut SolveApp, request: &str) -> String {
-    let reply = answer(app, request);
+    let reply = loop_guard(request).unwrap_or_else(|| answer(app, request));
     if let (Ok(mut calls), Ok(call)) = (CALLS.lock(), serde_json::from_str::<Value>(request)) {
         calls.push((call, reply.clone()));
     }
@@ -216,6 +216,25 @@ fn handle(app: &mut SolveApp, request: &str) -> String {
         t.push(format!("· {} → {}", request.chars().take(160).collect::<String>(), reply.chars().take(100).collect::<String>()));
     }
     reply
+}
+
+/// Stops a model that keeps repeating itself: after a hand-over (`escalate`), after the same call
+/// failed once already, or after too many calls, nothing more runs and the model is told to finish.
+fn loop_guard(request: &str) -> Option<String> {
+    const STOP: &str = "STOP: do not call any more tools. Reply with one short sentence.";
+    let calls = CALLS.lock().ok()?;
+    let tool = |c: &Value| c.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
+    let this: Value = serde_json::from_str(request).ok()?;
+    if calls.iter().any(|(c, _)| tool(c) == "escalate") && tool(&this) != "escalate" {
+        return Some(STOP.to_string());
+    }
+    if calls.len() >= 30 {
+        return Some(STOP.to_string());
+    }
+    if !matches!(tool(&this).as_str(), "inspect" | "find") && calls.iter().any(|(c, r)| *c == this && (r.starts_with("error") || r.starts_with("refused"))) {
+        return Some(format!("{STOP} This exact call already failed."));
+    }
+    None
 }
 
 fn answer(app: &mut SolveApp, request: &str) -> String {
@@ -275,10 +294,16 @@ fn answer(app: &mut SolveApp, request: &str) -> String {
                 }),
                 None => None,
             };
-            // Starting or opening another design drops what is on screen: not while it holds
-            // unsaved changes (the user saves first, or says so, and the app's own New asks).
-            if ["file.new", "doc.open"].contains(&command) && app.session.is_dirty() {
-                return "refused: the open design has unsaved changes. Tell the user to save it first (File > Save) or to start a new design with the File menu, which asks.".to_string();
+            // A new design opens in its own tab: the one on screen stays open, so nothing is lost.
+            if command == "file.new" {
+                if app.session.is_dirty() || !app.session.world_state().bodies.is_empty() {
+                    solidcraft_ui_egui::documents::new_tab(app);
+                    return "ok: a new design opened in a new tab; the previous design is still open in its own tab".to_string();
+                }
+                return "ok: the design on screen is already empty".to_string();
+            }
+            if command == "doc.open" && app.session.is_dirty() {
+                return "refused: the open design has unsaved changes. Tell the user to open the file from the File menu, which opens it in a new tab. Do not call again.".to_string();
             }
             match app.run(command, params.unwrap_or_else(|| json!({}))) {
                 Ok(r) => short_result(&r),
