@@ -29,6 +29,7 @@ egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 log = { workspace = true }
 serde_json = { workspace = true }
+png = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"

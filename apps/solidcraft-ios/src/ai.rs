@@ -8,6 +8,7 @@
 //! allows `unsafe` (as `picker` and `keyboard` do).
 #![allow(unsafe_code)]
 use std::ffi::{CStr, CString, c_char};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
@@ -646,8 +647,75 @@ fn parse_script(text: &str) -> Vec<ScriptItem> {
         .collect()
 }
 
+/// Where a request for Claude on the Mac (the Pro plan) has got to.
+#[derive(Clone, Copy, PartialEq)]
+enum ProStage {
+    /// Saving the prompt, the design and the state.
+    Collect,
+    /// Waiting for the screenshot.
+    AwaitShot,
+    /// Saved: waiting for Claude on the Mac to put a reply in responses/<id>/.
+    Waiting,
+    /// A reply is here: the steps are shown, to run or discard.
+    Review,
+    Running,
+    /// Steps run: waiting for the screenshot afterwards.
+    AwaitAfter,
+    Done,
+    Undoing,
+}
+
+/// A request for Claude on the Mac. The iPad writes `Documents/ai/requests/<id>/` (request.json, inspect.txt,
+/// design.json, screen.png, ready.txt); the Mac answers with `Documents/ai/responses/<id>/response.json`
+/// (`{"title", "explanation", "script": [{"command", "params"}]}`); the iPad writes results.json, after.json,
+/// after.png and results-ready.txt next to the request.
+struct Pro {
+    id: u64,
+    prompt: String,
+    stage: ProStage,
+    title: String,
+    explanation: String,
+    steps: Vec<Value>,
+    results: Vec<Value>,
+    undoable: usize,
+    wait_until: u64,
+    shot_sent: bool,
+}
+
+fn pro_dir(id: u64) -> PathBuf {
+    ai_data::dir().join("requests").join(id.to_string())
+}
+
+fn pro_reply_dir(id: u64) -> PathBuf {
+    ai_data::dir().join("responses").join(id.to_string())
+}
+
+/// The title, explanation and steps of the Mac's reply, if it is there and complete.
+fn read_reply(id: u64) -> Option<(String, String, Vec<Value>)> {
+    let text = std::fs::read_to_string(pro_reply_dir(id).join("response.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let steps: Vec<Value> = v.get("script").or_else(|| v.get("commands")).and_then(Value::as_array)?.iter().take(500).cloned().collect();
+    let text_of = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    Some((text_of("title"), text_of("explanation"), steps))
+}
+
+/// A screenshot as a PNG file.
+fn write_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.size[0] as u32, image.size[1] as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    let data: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+    writer.write_image_data(&data).map_err(|e| e.to_string())
+}
+
 #[derive(Default)]
 pub struct State {
+    pro: Option<Pro>,
+    pro_poll: u64,
+    /// Run a reply from the Mac as soon as it arrives (otherwise the steps are shown first).
+    pro_auto: bool,
     script: Option<ScriptRun>,
     script_poll: u64,
     /// Fold the Demo script section on the next frame.
@@ -948,6 +1016,239 @@ fn undoable(call: &Value, reply: &str) -> bool {
         self.ask_local(&self.hints.rewrite(&typed));
     }
 
+    /// Start a request for Claude on the Mac (the Pro plan): the files are written over the next frames.
+    fn ask_pro(&mut self) {
+        let prompt = std::mem::take(&mut self.input).trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        self.stop_speaking();
+        let id = ai_data::now_millis();
+        let _ = std::fs::create_dir_all(pro_dir(id));
+        let _ = std::fs::create_dir_all(pro_reply_dir(id));
+        let request = json!({
+            "id": id,
+            "prompt": prompt,
+            "files": ["inspect.txt", "design.json", "screen.png"],
+            "reply_to": format!("Documents/ai/responses/{id}/response.json"),
+            "reply_format": { "title": "short", "explanation": "what the steps do", "script": [{ "command": "solid.box", "params": {} }] },
+        });
+        let _ = std::fs::write(pro_dir(id).join("request.json"), serde_json::to_string_pretty(&request).unwrap_or_default());
+        self.log.push(format!("You (Claude on the Mac): {prompt}"));
+        self.pro = Some(Pro { id, prompt, stage: ProStage::Collect, title: String::new(), explanation: String::new(), steps: Vec::new(), results: Vec::new(), undoable: 0, wait_until: 0, shot_sent: false });
+        repaint();
+    }
+
+    /// The parts of a Pro request that need the app: saving the state, running the steps, undoing them.
+    fn pro_tick(&mut self, app: &mut SolveApp) {
+        let Some(mut pro) = self.pro.take() else { return };
+        let mut keep = true;
+        match pro.stage {
+            ProStage::Collect => {
+                let dir = pro_dir(pro.id);
+                let inspect = answer(app, "{\"tool\":\"inspect\"}");
+                let _ = std::fs::write(dir.join("inspect.txt"), inspect);
+                let design = dir.join("design.json");
+                if app.run("file.export", json!({ "path": design.to_string_lossy(), "format": "json" })).is_err() {
+                    self.log.push("· Could not save a copy of the design".to_string());
+                }
+                pro.wait_until = ai_data::now_millis() + 300;
+                pro.stage = ProStage::AwaitShot;
+            }
+            ProStage::Running => {
+                let mut results = Vec::new();
+                for (i, step) in pro.steps.iter().enumerate() {
+                    let command = step.get("command").or_else(|| step.get("id")).and_then(Value::as_str).unwrap_or("").to_string();
+                    let params = step.get("params").cloned().unwrap_or_else(|| json!({}));
+                    match app.run(&command, params) {
+                        Ok(r) => {
+                            if Self::undoable(&json!({ "tool": "run", "command": command }), "ok") {
+                                pro.undoable += 1;
+                            }
+                            results.push(json!({ "step": i + 1, "command": command, "ok": true, "result": short_result(&r) }));
+                        }
+                        Err(e) => {
+                            results.push(json!({ "step": i + 1, "command": command, "ok": false, "error": clip(e.to_string()) }));
+                            break;
+                        }
+                    }
+                }
+                pro.results = results;
+                let after = pro_dir(pro.id).join("after.json");
+                let _ = app.run("file.export", json!({ "path": after.to_string_lossy(), "format": "json" }));
+                pro.wait_until = ai_data::now_millis() + 700;
+                pro.shot_sent = false;
+                pro.stage = ProStage::AwaitAfter;
+            }
+            ProStage::Undoing => {
+                for _ in 0..pro.undoable {
+                    let _ = app.run("edit.undo", json!({}));
+                }
+                self.log.push(format!("· Undid the {} steps from Claude on the Mac", pro.undoable));
+                keep = false;
+            }
+            _ => {}
+        }
+        if keep {
+            self.pro = Some(pro);
+        }
+    }
+
+    /// The parts of a Pro request that need the window: screenshots, and looking for the Mac's reply.
+    fn pro_step(&mut self, ctx: &egui::Context) {
+        let now = ai_data::now_millis();
+        let shot = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }));
+        if self.pro.is_none() {
+            // A reply that is waiting for a request this app no longer remembers (it was restarted) is offered again.
+            if now.saturating_sub(self.pro_poll) > 4000 && self.open {
+                self.pro_poll = now;
+                self.pro_resume();
+            }
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        let Some(mut pro) = self.pro.take() else { return };
+        match pro.stage {
+            ProStage::AwaitShot | ProStage::AwaitAfter => {
+                if !pro.shot_sent && now >= pro.wait_until {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                    pro.shot_sent = true;
+                }
+                if let (true, Some(image)) = (pro.shot_sent, shot) {
+                    let dir = pro_dir(pro.id);
+                    if pro.stage == ProStage::AwaitShot {
+                        let _ = write_png(&dir.join("screen.png"), &image);
+                        let _ = std::fs::write(dir.join("ready.txt"), "ready\n");
+                        self.log.push("· Saved. On the Mac, ask Claude to pick up the latest iPad request.".to_string());
+                        pro.stage = ProStage::Waiting;
+                    } else {
+                        let _ = write_png(&dir.join("after.png"), &image);
+                        let failed = pro.results.iter().any(|r| r.get("ok").and_then(Value::as_bool) == Some(false));
+                        let summary = json!({ "id": pro.id, "prompt": pro.prompt, "ok": !failed, "steps": pro.results, "files": ["after.json", "after.png"] });
+                        let _ = std::fs::write(dir.join("results.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
+                        let _ = std::fs::write(dir.join("results-ready.txt"), "ready\n");
+                        self.log.push(if failed { "· Ran the steps and one failed: results saved for Claude on the Mac".to_string() } else { "· Ran the steps: results saved for Claude on the Mac".to_string() });
+                        pro.stage = ProStage::Done;
+                    }
+                    pro.shot_sent = false;
+                }
+            }
+            ProStage::Waiting if now.saturating_sub(self.pro_poll) > 1500 => {
+                self.pro_poll = now;
+                if let Some((title, explanation, steps)) = read_reply(pro.id) {
+                    pro.title = title;
+                    pro.explanation = explanation;
+                    pro.steps = steps;
+                    self.log.push(format!("· Claude on the Mac replied: {} steps", pro.steps.len()));
+                    pro.stage = if self.pro_auto { ProStage::Running } else { ProStage::Review };
+                }
+            }
+            _ => {}
+        }
+        self.pro = Some(pro);
+    }
+
+    /// Offer a reply that arrived for a request made before the app was restarted.
+    fn pro_resume(&mut self) {
+        let Ok(entries) = std::fs::read_dir(ai_data::dir().join("responses")) else { return };
+        let mut ids: Vec<u64> = entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect();
+        ids.sort_unstable();
+        for id in ids.into_iter().rev() {
+            if pro_dir(id).join("results.json").exists() {
+                continue;
+            }
+            if let Some((title, explanation, steps)) = read_reply(id) {
+                let prompt = std::fs::read_to_string(pro_dir(id).join("request.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                    .and_then(|v| v.get("prompt").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_default();
+                self.log.push(format!("· Claude on the Mac replied to an earlier request: {} steps", steps.len()));
+                self.pro = Some(Pro { id, prompt, stage: ProStage::Review, title, explanation, steps, results: Vec::new(), undoable: 0, wait_until: 0, shot_sent: false });
+                return;
+            }
+        }
+    }
+
+    /// The panel for a request to Claude on the Mac: its state, and what to do next.
+    fn pro_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(pro) = self.pro.as_ref() else { return };
+        let mut action = "";
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Claude on the Mac (Pro plan)").strong());
+            ui.label(egui::RichText::new(pro.prompt.clone()).weak());
+            match pro.stage {
+                ProStage::Collect | ProStage::AwaitShot => {
+                    ui.label("Saving the request…");
+                }
+                ProStage::Waiting => {
+                    ui.label("Saved. Waiting for Claude on the Mac: ask it to pick up the latest iPad request.");
+                    ui.checkbox(&mut self.pro_auto, "Run its steps as soon as they arrive");
+                    if ui.button("Cancel").clicked() {
+                        action = "discard";
+                    }
+                }
+                ProStage::Review => {
+                    if !pro.title.is_empty() {
+                        ui.label(egui::RichText::new(pro.title.clone()).strong());
+                    }
+                    if !pro.explanation.is_empty() {
+                        ui.label(pro.explanation.clone());
+                    }
+                    egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                        for (i, step) in pro.steps.iter().enumerate() {
+                            let command = step.get("command").or_else(|| step.get("id")).and_then(Value::as_str).unwrap_or("?");
+                            ui.label(format!("{}. {command}", i + 1));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Run these steps").clicked() {
+                            action = "run";
+                        }
+                        if ui.button("Discard").clicked() {
+                            action = "discard";
+                        }
+                    });
+                }
+                ProStage::Running | ProStage::AwaitAfter | ProStage::Undoing => {
+                    ui.label("Running…");
+                }
+                ProStage::Done => {
+                    let failed = pro.results.iter().find(|r| r.get("ok").and_then(Value::as_bool) == Some(false));
+                    match failed {
+                        Some(f) => ui.label(format!("Stopped at step {}: {}", f["step"], f["error"].as_str().unwrap_or(""))),
+                        None => ui.label(format!("Ran all {} steps.", pro.results.len())),
+                    };
+                    ui.label("The results are saved: ask Claude on the Mac to check them.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Undo these steps").clicked() {
+                            action = "undo";
+                        }
+                        if ui.button("Close").clicked() {
+                            action = "discard";
+                        }
+                    });
+                }
+            }
+        });
+        match action {
+            "run" => {
+                if let Some(p) = self.pro.as_mut() {
+                    p.stage = ProStage::Running;
+                }
+            }
+            "undo" => {
+                if let Some(p) = self.pro.as_mut() {
+                    p.stage = ProStage::Undoing;
+                }
+            }
+            "discard" => {
+                self.pro = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Whether the iPad has a network path.
     fn online(&mut self) -> bool {
         self.bridge().map(|b| (b.online)() == 1).unwrap_or(true)
@@ -1128,6 +1429,7 @@ fn undoable(call: &Value, reply: &str) -> bool {
         for (action, amount) in std::mem::take(&mut self.view_queue) {
             change_view(app, &json!({ "action": action, "amount": amount }));
         }
+        self.pro_tick(app);
         // A hand-over starts from the design as it was before the on-device model touched it.
         if let Some((steps, request, tier)) = self.after_undo.take() {
             for _ in 0..steps {
@@ -1225,6 +1527,7 @@ fn undoable(call: &Value, reply: &str) -> bool {
     pub fn show(&mut self, ctx: &egui::Context, lift: f32) {
         let _ = CTX.set(ctx.clone());
         self.script_step();
+        self.pro_step(ctx);
         // While a script plays the screen refreshes often; otherwise now and then, to notice ai-script.run.
         ctx.request_repaint_after(std::time::Duration::from_millis(if self.script.is_some() { 40 } else { 2000 }));
         if self.listening {
@@ -1353,6 +1656,7 @@ fn undoable(call: &Value, reply: &str) -> bool {
                     }
                 }
             });
+            self.pro_panel(ui);
             ui.separator();
             // Enter asks; Shift+Enter is a new line.
             let id = egui::Id::new("ai_input");
@@ -1368,6 +1672,9 @@ fn undoable(call: &Value, reply: &str) -> bool {
                 }
                 if self.has_key && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new("Ask Claude")).clicked() {
                     self.submit(true);
+                }
+                if ui.add_enabled(self.pro.is_none() && !self.input.trim().is_empty(), egui::Button::new("Ask Claude (Pro)")).clicked() {
+                    self.ask_pro();
                 }
                 if self.local_state == "ready" && ui.add_enabled(!self.busy && !self.input.trim().is_empty(), egui::Button::new(format!("Ask {LOCAL_NAME}"))).clicked() {
                     self.submit_local();
