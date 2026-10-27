@@ -1076,7 +1076,13 @@ fn undoable(call: &Value, reply: &str) -> bool {
                 pro.results = results;
                 let after = pro_dir(pro.id).join("after.json");
                 let _ = app.run("file.export", json!({ "path": after.to_string_lossy(), "format": "json" }));
-                pro.wait_until = ai_data::now_millis() + 700;
+                // Frame everything, clear of this window, so the picture shows what changed.
+                let mut cam = app.fitted(app.cam);
+                cam.distance *= 1.3;
+                cam.pan(-110.0, 0.0, 800.0);
+                app.cam_anim = None;
+                app.cam = cam;
+                pro.wait_until = ai_data::now_millis() + 900;
                 pro.shot_sent = false;
                 pro.stage = ProStage::AwaitAfter;
             }
@@ -1163,7 +1169,13 @@ fn undoable(call: &Value, reply: &str) -> bool {
                     .and_then(|t| serde_json::from_str::<Value>(&t).ok())
                     .and_then(|v| v.get("prompt").and_then(Value::as_str).map(str::to_string))
                     .unwrap_or_default();
-                self.log.push(format!("· Claude on the Mac replied to an earlier request: {} steps", steps.len()));
+                // A reply the Mac started (no request from this app) still gets a folder for its results.
+                let _ = std::fs::create_dir_all(pro_dir(id));
+                let request = pro_dir(id).join("request.json");
+                if !request.exists() {
+                    let _ = std::fs::write(request, json!({ "id": id, "prompt": if title.is_empty() { "(started on the Mac)" } else { title.as_str() } }).to_string());
+                }
+                self.log.push(format!("· Claude on the Mac replied: {} steps", steps.len()));
                 self.pro = Some(Pro { id, prompt, stage: ProStage::Review, title, explanation, steps, results: Vec::new(), undoable: 0, wait_until: 0, shot_sent: false });
                 return;
             }
